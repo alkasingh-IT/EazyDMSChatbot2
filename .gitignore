@@ -1,0 +1,36 @@
+.env
+.env.*
+!.env.example
+
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+.dms_sessions/
+.dms_rsa_private_key.pem
+.user_prefs.enc
+nohup.out
+
+*.log
+logs/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Private and runtime data
+*.pem
+*.key
+*.enc
+
+# Historical application backups
+.update_backups/
+**/.update_backups/
+
+# Python caches
+__pycache__/
+*.py[cod]
