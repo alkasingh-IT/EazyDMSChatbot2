@@ -8,13 +8,13 @@ import multiprocessing
 import uvicorn
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from .config.settings import settings
-from .routes import main_router, analytics_router, chat_router, staff_router, export_router, database_router, speech_router, prefs_router
+from .routes import main_router, analytics_router, chat_router, staff_router, export_router, database_router, speech_router, prefs_router, chat_actions_router
 from .db import current_user_id
 from .auth import is_public_path, require_request_identity
 from fastapi.responses import JSONResponse
@@ -206,7 +206,9 @@ async def log_incoming_request(request: Request, call_next):
         return await call_next(request)
 
     # ── Auth gate for protected /api routes ────────────────────────────────────
-    if request.url.path.startswith("/api") and not is_public_path(request.url.path):
+    # The password-gated native chat is exempt here; its identity + default-DB
+    # usage are handled inside the chat route itself.
+    if request.url.path.startswith("/api") and not is_public_path(request.url.path) and not _nc_is_native(request):
         try:
             is_pref_lang = (request.url.path == "/api/prefs/output-lang")
             identity = require_request_identity(request, allow_session_staff_resolution=is_pref_lang)
@@ -273,6 +275,107 @@ app.include_router(export_router)
 app.include_router(database_router)
 app.include_router(speech_router)
 app.include_router(prefs_router)
+app.include_router(chat_actions_router)
+
+# ── Native (d3) chat — password-gated, toggle-controlled (backend only) ──────
+try:
+    from .services.native_gate import (
+        enabled as _native_chat_enabled,
+        check_basic_auth as _nc_check_basic,
+        challenge_headers as _nc_challenge_headers,
+        is_native_chat as _nc_is_native,
+        issue_cookie as _nc_issue_cookie,
+    )
+except ImportError:
+    from services.native_gate import (
+        enabled as _native_chat_enabled,
+        check_basic_auth as _nc_check_basic,
+        challenge_headers as _nc_challenge_headers,
+        is_native_chat as _nc_is_native,
+        issue_cookie as _nc_issue_cookie,
+    )
+
+_d3_dir = settings.BASE_DIR / "app" / "d3"
+
+
+def _nc_require_basic(request: Request) -> None:
+    """Backend-only password gate: standard HTTP Basic Auth (browser prompt)."""
+    if not _nc_check_basic(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Owzy access password required.",
+            headers=_nc_challenge_headers(),
+        )
+
+
+def _nc_unlock_cookie(resp, request: Request):
+    """After a successful unlock, set the signed gate cookie so the browser also
+    sends it on JS fetch() calls to /api/* (which never carry Basic)."""
+    try:
+        resp.set_cookie(
+            "nc_gate", _nc_issue_cookie(),
+            max_age=12 * 3600, httponly=True, samesite="lax",
+            secure=(request.url.scheme == "https"), path="/",
+        )
+    except Exception:
+        pass
+    return resp
+
+
+@app.get("/api/native-chat/status", include_in_schema=False)
+def native_chat_status():
+    """Master ON/OFF switch (env NATIVE_CHAT_ENABLED)."""
+    return {"enabled": _native_chat_enabled(), "auth": "basic"}
+
+
+@app.get("/d3/DMSAIChat.jsx", include_in_schema=False)
+def serve_d3_chat_jsx(request: Request):
+    if not _native_chat_enabled():
+        return JSONResponse({"error": "Native chat is disabled. Please use the main application."}, status_code=404)
+    _nc_require_basic(request)
+    f = _d3_dir / "DMSAIChat (2).jsx"
+    if f.exists():
+        return _nc_unlock_cookie(FileResponse(str(f), media_type="text/javascript"), request)
+    return JSONResponse({"error": "d3 DMSAIChat (2).jsx not found"}, status_code=404)
+
+
+@app.get("/d3/{fname:path}", include_in_schema=False)
+def serve_d3_asset(fname: str, request: Request):
+    if not _native_chat_enabled():
+        return JSONResponse({"error": "Native chat is disabled."}, status_code=404)
+    _nc_require_basic(request)
+    safe = (_d3_dir / fname).resolve()
+    if not str(safe).startswith(str(_d3_dir.resolve())) or not safe.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    media = "application/octet-stream"
+    lower = fname.lower()
+    if lower.endswith(".css"):
+        media = "text/css"
+    elif lower.endswith(".png"):
+        media = "image/png"
+    elif lower.endswith((".jpg", ".jpeg")):
+        media = "image/jpeg"
+    elif lower.endswith(".svg"):
+        media = "image/svg+xml"
+    return _nc_unlock_cookie(FileResponse(str(safe), media_type=media), request)
+
+
+@app.get("/dmsai", include_in_schema=False)
+@app.get("/dmsai.html", include_in_schema=False)
+def serve_dmsai_harness(request: Request):
+    """Gated test harness (was /static/dmsai.html — moved out of the static dir
+    so it cannot bypass the password gate)."""
+    if not _native_chat_enabled():
+        return HTMLResponse(
+            "<h3>Native chat is turned off</h3><p>Please use the main application.</p>",
+            status_code=404,
+        )
+    _nc_require_basic(request)
+    f = _d3_dir / "dmsai.html"
+    if f.exists():
+        return _nc_unlock_cookie(FileResponse(str(f)), request)
+    return JSONResponse({"error": "d3/dmsai.html not found"}, status_code=503)
+
 
 # Mount static files
 if settings.STATIC_DIR.exists():

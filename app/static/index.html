@@ -1,287 +1,295 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  
-
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
-  <title>DMS Analytics — Distributor Management System</title>
-  <meta name="description" content="AI-powered DMS analytics: secondary sales, purchases, and primary sales intelligence."/>
-  <link rel="preconnect" href="https://fonts.googleapis.com"/>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Owzy Chat &mdash; DMS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="/static/style.css?v=2"/>
-  <link rel="stylesheet" href="/static/chat.css?v=2"/>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      font-family: 'Inter', sans-serif;
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+      background: #f4f6fb;
+    }
+
+    /* ── Slim control rail ─────────────────────────────────────── */
+    .nc-rail {
+      width: 270px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 20px 16px;
+      background: #101828;
+      color: #e8eaf0;
+      overflow-y: auto;
+    }
+    .nc-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+    .nc-brand-icon {
+      width: 38px; height: 38px; border-radius: 10px;
+      background: linear-gradient(135deg, #8b2f10, #e66b17);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; color: #fff;
+    }
+    .nc-brand-title { font-size: 14px; font-weight: 700; color: #fff; }
+    .nc-brand-sub   { font-size: 10.5px; color: #8f95a8; }
+    .nc-label {
+      font-size: 10.5px; font-weight: 700; letter-spacing: .06em;
+      text-transform: uppercase; color: #98a2b3; margin: 10px 0 5px;
+    }
+    .nc-select, .nc-toggle {
+      width: 100%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      color: #e8eaf0;
+      border-radius: 9px;
+      padding: 9px 11px;
+      font-size: 12.5px;
+      font-family: 'Inter', sans-serif;
+      outline: none;
+    }
+    .nc-select option { color: #101828; }
+    .nc-toggle {
+      cursor: pointer;
+      display: flex; justify-content: space-between; align-items: center;
+      text-align: left;
+    }
+    .nc-toggle--on { border-color: rgba(230,107,23,.65); box-shadow: 0 0 0 1px rgba(230,107,23,.35) inset; }
+    .nc-rail-note {
+      margin-top: auto; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.08);
+      font-size: 10.5px; color: #667085; line-height: 1.5;
+    }
+    .nc-rail-warn { color: #f59e0b; }
+
+    /* ── Chat stage ────────────────────────────────────────────── */
+    #view-chat { flex: 1; min-width: 0; height: 100%; }
+    .native-chat-root { height: 100%; }
+    .native-chat-loading {
+      height: 100%; display: flex; align-items: center; justify-content: center;
+      color: #667085; font-size: 13px; text-align: center;
+    }
+    @media (max-width: 720px) {
+      .nc-rail { position: absolute; z-index: 20; height: 100%; }
+      .nc-rail--hidden { display: none; }
+      .nc-menu-btn { display: flex !important; }
+    }
+    .nc-menu-btn {
+      display: none;
+      position: fixed; top: 12px; left: 12px; z-index: 30;
+      width: 38px; height: 38px; border-radius: 9px;
+      background: rgba(16,24,40,0.9); border: 1px solid rgba(255,255,255,0.12);
+      color: #fff; align-items: center; justify-content: center; cursor: pointer;
+    }
+  </style>
 </head>
 <body>
 
-<div class="sidebar-overlay" id="sidebarOverlay"></div>
+<button class="nc-menu-btn" id="ncMenuBtn" title="Menu" aria-label="Menu">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+</button>
 
-<aside class="sidebar" id="sidebar">
-  <div class="sidebar-logo">
-    <div class="logo-icon"></div>
+<!-- ── Control rail: staff selector + BI on/off ────────────────── -->
+<aside class="nc-rail" id="ncRail">
+  <div class="nc-brand">
+    <div class="nc-brand-icon">&#9889;</div>
     <div>
-      <div class="logo-title">DMS Analytics</div>
-      <div class="logo-sub">Distributor Management System</div>
+      <div class="nc-brand-title">Owzy Chat</div>
+      <div class="nc-brand-sub">DMS Analytics</div>
     </div>
   </div>
 
-  <nav class="sidebar-nav">
-    <div class="nav-section-label">AI Assistant</div>
-    <div class="nav-item active" data-view="chat" id="nav-chat">
-      <span class="nav-icon"></span> AI Chatbot
-    </div>
+  <label class="nc-label" for="staffUid">Staff Member</label>
+  <select id="staffUid" class="nc-select">
+    <option value="">Loading staff...</option>
+  </select>
 
-    <div class="nav-section-label">Secondary Sales</div>
-    <div class="nav-item" data-view="ss-overview"><span class="nav-icon"></span> Overview / KPI</div>
-    <div class="nav-item" data-view="ss-items"><span class="nav-icon"></span> By Item (Top N)</div>
-    <div class="nav-item" data-view="ss-dealers"><span class="nav-icon"></span> Top Dealers</div>
-    <div class="nav-item" data-view="ss-category"><span class="nav-icon">️</span> By Category</div>
-    <div class="nav-item" data-view="ss-trend"><span class="nav-icon"></span> Trend (3M)</div>
-    <div class="nav-item" data-view="ss-growth"><span class="nav-icon"></span> Growth (MoM)</div>
-    <div class="nav-item" data-view="ss-distributor"><span class="nav-icon"></span> By Distributor</div>
-    <div class="nav-item" data-view="ss-team"><span class="nav-icon"></span> Team by SO</div>
-    <div class="nav-item" data-view="ss-national"><span class="nav-icon"></span> National [NSM]</div>
-    <div class="nav-item" data-view="ss-cumulative"><span class="nav-icon"></span> Cumulative Monthly</div>
-    <div class="nav-item" data-view="ss-quarterly"><span class="nav-icon">️</span> Quarterly Summary</div>
-    <div class="nav-item" data-view="ss-invoice-range"><span class="nav-icon"></span> Invoice Range</div>
+  <label class="nc-label" style="margin-top:12px;">AI Analytics</label>
+  <button id="aiAnalyticsToggle" class="nc-toggle" style="cursor:pointer;">
+    <span id="aiAnalyticsState">OFF &mdash; Direct BI</span>
+    <span>&#128267;</span>
+  </button>
 
-    <div class="nav-section-label">Purchases</div>
-    <div class="nav-item" data-view="pur-overview"><span class="nav-icon"></span> Overview / Entries</div>
-    <div class="nav-item" data-view="pur-category"><span class="nav-icon">️</span> By Category</div>
-    <div class="nav-item" data-view="pur-item"><span class="nav-icon"></span> Item History</div>
-    <div class="nav-item" data-view="pur-pending"><span class="nav-icon">⏳</span> Pending Entries</div>
-    <div class="nav-item" data-view="pur-distributor"><span class="nav-icon"></span> By Distributor</div>
-    <div class="nav-item" data-view="pur-trend"><span class="nav-icon"></span> Trend (6M)</div>
-    <div class="nav-item" data-view="pur-recon"><span class="nav-icon">⚖️</span> Reconciliation</div>
-    <div class="nav-item" data-view="pur-cumulative"><span class="nav-icon"></span> Cumulative Monthly</div>
-    <div class="nav-item" data-view="pur-quarterly"><span class="nav-icon">️</span> Quarterly Summary</div>
-    <div class="nav-item" data-view="pur-invoice-range"><span class="nav-icon"></span> Invoice Range</div>
-
-    <div class="nav-section-label">Primary Sales</div>
-    <div class="nav-item" data-view="pr-overview"><span class="nav-icon"></span> Overview / KPI</div>
-    <div class="nav-item" data-view="pr-invoices"><span class="nav-icon"></span> Invoices (30d)</div>
-    <div class="nav-item" data-view="pr-sku"><span class="nav-icon"></span> By SKU / Item</div>
-    <div class="nav-item" data-view="pr-distributor"><span class="nav-icon">️</span> By Distributor</div>
-    <div class="nav-item" data-view="pr-ratio"><span class="nav-icon">⚖️</span> vs Secondary Ratio</div>
-    <div class="nav-item" data-view="pr-trend"><span class="nav-icon"></span> Trend (6M)</div>
-    <div class="nav-item" data-view="pr-national"><span class="nav-icon"></span> National [NSM]</div>
-
-    <div class="nav-section-label">Dashboards</div>
-    <div class="nav-item" data-view="combined"><span class="nav-icon"></span> Combined Dashboard</div>
-    <div class="nav-item" data-view="group"><span class="nav-icon"></span> Group Analytics</div>
-
-    <div id="unlockBtnWrap">
-      <button class="nav-unlock-btn" onclick="openUnlockModal()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-        Unlock All Modules
-      </button>
-    </div>
-  </nav>
-
-  <div class="sidebar-staff">
-    <span class="staff-label"> Staff / User</span>
-    <select class="staff-select" id="staffSelect"><option value="">Loading...</option></select>
-    <div id="staffInfoCard" style="display:none;margin-top:10px;padding:10px 12px;background:rgba(255,255,255,.05);border-radius:8px;border:1px solid rgba(255,255,255,.08);font-size:12px;line-height:1.7;color:#9ca3af;">
-      <div id="siName"  style="font-size:13px;font-weight:700;color:#e8eaf0;margin-bottom:4px;"></div>
-      <div id="siDesig" style="color:#f5c842;margin-bottom:6px;font-size:11px;"></div>
-      <div id="siUsername"></div>
-      <div id="siEmpCode"></div>
-      <div id="siEmail"></div>
-      <div id="siMobile"></div>
-    </div>
+  <div class="nc-rail-note" id="ncRailNote">
+    Ask anything about your sales force data. Reports, trends, and instant answers,
+    all scoped to your territory.
   </div>
 </aside>
 
-<main class="main-content">
-  <div class="topbar">
-    <div style="display:flex;align-items:center;gap:12px;min-width:0">
-      <button class="hamburger" id="hamburger" aria-label="Menu">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-      </button>
-      <div>
-        <div class="page-title" id="viewTitle">AI Assistant</di  <section class="view" id="view-group">eight="90"></canvas>
-    </div>
-    <div class="table-card">
-      <div class="table-header"><div class="table-title">Cross-Comparison — Distributor-wise (All Modules)</div></div>
-      <div id="cbCrossTable"><div class="empty-state"><div class="empty-icon"></div>Select staff + toggle God Mode for full data.</div></div>
-    </div>
-  </section>
-
-  <section class="view" id="view-group">
-    <div class="query-bar">
-      <div class="qb-title"> Group Analytics</div>
-      <div class="qb-row">
-        <label>User IDs (comma-sep) <input type="text" id="groupUserIds" class="qb-text" value="" placeholder="e.g. 1,2,3" style="width:200px"></label>
-        <label>Flag <select id="groupFlagSelect" class="qb-text" style="width:200px"></select></label>
-        <button class="qb-apply" id="groupRunBtn">Run Group</button>
-      </div>
-    </div>
-    <div class="kpi-card" style="margin-bottom:10px">
-      <div class="kpi-label"> Group Results — <span id="groupFlagLabel">—</span></div>
-      <div class="kpi-sub">Comparing across <span id="groupUserCount">0</span> users</div>
-    </div>
-    <div class="table-card">
-      <div class="table-header"><div class="table-title">Group Comparison</div></div>
-      <div id="groupTable"><div class="empty-state"><div class="empty-icon"></div>Enter user IDs, select a flag, and click Run Group.</div></div>
-    </div>
-  </section>
-
-  <section class="view" id="view-custom-query">
-    <div class="query-bar">
-      <div class="qb-title"> Custom SQL Query</div>
-      <div class="qb-row" style="flex-wrap:wrap">
-        <label>God Mode <input type="checkbox" id="customGodMode" checked></label>
-        <button class="qb-apply" id="customQueryRunBtn">▶ Run Query</button>
-        <button class="qb-reset" id="customQueryClearBtn">Clear</button>
-      </div>
-    </div>
-    <div class="table-card" style="margin-bottom:10px">
-      <div class="table-header"><div class="table-title">SQL</div></div>
-      <textarea id="customSqlInput" rows="6" style="width:100%;background:var(--bg3);border:none;padding:12px 16px;font-family:monospace;font-size:12.5px;color:var(--text);outline:none;resize:vertical;box-sizing:border-box" placeholder="SELECT * FROM transactiondetail LIMIT 10"></textarea>
-    </div>
-    <div class="kpi-card" id="customQueryMeta" style="display:none">
-      <div class="kpi-label">Results</div>
-      <div class="kpi-sub" id="customQueryInfo">— rows</div>
-    </div>
-    <div class="table-card">
-      <div class="table-header"><div class="table-title">Query Results</div></div>
-      <div id="customQueryTable"><div class="empty-state"><div class="empty-icon"></div>Write a SELECT query above and click Run Query.</div></div>
-    </div>
-  </section>
-
-  <div id="aiReportModal" class="ai-modal-overlay">
-    <div class="ai-modal">
-      <div class="ai-modal-header">
-        <div style="display:flex;align-items:center;gap:12px">
-          <div class="ai-modal-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg></div>
-          <div><div class="ai-modal-title">AI Excel Report</div><div class="ai-modal-sub">Describe the report you want generated</div></div>
-        </div>
-        <button id="aiModalClose" class="ai-modal-close">&times;</button>
-      </div>
-      <div class="ai-modal-body">
-        <label class="ai-modal-label">Report description</label>
-        <textarea id="aiReportPrompt" class="ai-modal-textarea" placeholder="e.g. Show top 10 dealers sorted by sales with growth %…"></textarea>
-        <div class="ai-modal-chips">
-          <button class="ai-modal-chip" data-text="Summary of top dealers by secondary sales this month"><div class="ai-modal-chip-title">Top Dealers</div><div class="ai-modal-chip-sub">Ranked by secondary sales</div></button>
-          <button class="ai-modal-chip" data-text="Month-over-month growth analysis with % change"><div class="ai-modal-chip-title">MoM Growth</div><div class="ai-modal-chip-sub">With % change columns</div></button>
-          <button class="ai-modal-chip" data-text="Full item-wise breakdown with quantities and values"><div class="ai-modal-chip-title">Item Breakdown</div><div class="ai-modal-chip-sub">Qty, value, all SKUs</div></button>
-          <button class="ai-modal-chip" data-text="Category-wise summary with totals and percentages"><div class="ai-modal-chip-title">Category Summary</div><div class="ai-modal-chip-sub">Totals &amp; share %</div></button>
-        </div>
-        <div id="aiReportErr" class="ai-modal-err"></div>
-        <div class="ai-modal-footer">
-          <button id="aiModalCancel" class="ai-modal-cancel">Cancel</button>
-          <button id="aiModalGenerate" class="ai-modal-generate">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-            Generate Excel
-          </button>
-        </div>
-      </div>
-    </div>
+<!-- ── Native chat stage ───────────────────────────────────────── -->
+<main id="view-chat" class="active">
+  <div id="nativeChatRoot" class="native-chat-root">
+    <div class="native-chat-loading">Loading Owzy chat...</div>
   </div>
-
-  <div id="unlockOverlay" class="unlock-overlay" style="display:none" onclick="if(event.target===this)closeUnlockModal()">
-    <div class="unlock-box">
-      <div class="unlock-header">
-        <span class="unlock-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
-        <div><div class="unlock-title">Unlock All Modules</div><div class="unlock-sub">Enter your access password to view all analytics</div></div>
-      </div>
-      <div class="unlock-body">
-        <input type="password" id="unlockInput" class="unlock-input" placeholder="Enter password…" onkeydown="if(event.key==='Enter')attemptUnlock()" />
-        <div id="unlockErr" class="unlock-err" style="display:none">Incorrect password. Please try again.</div>
-        <div class="unlock-footer">
-          <button class="unlock-cancel" onclick="closeUnlockModal()">Cancel</button>
-          <button class="unlock-go" onclick="attemptUnlock()">Unlock Access</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-  (function() {
-    var UNLOCK_KEY  = 'dms_unlocked';
-    var CORRECT_PWD = 'HELLOERP';
-    function isUnlocked() { return sessionStorage.getItem(UNLOCK_KEY) === '1'; }
-    function getViewName(el) { return el.getAttribute('data-view'); }
-    function applyLockState() {
-      var unlocked = isUnlocked();
-      document.querySelectorAll('.nav-item').forEach(function(el) {
-        var v = getViewName(el);
-        el.style.display = (!unlocked && v !== 'chat') ? 'none' : '';
-      });
-      document.querySelectorAll('.nav-section-label').forEach(function(el) {
-        var txt = el.textContent.trim();
-        el.style.display = (!unlocked && txt !== 'AI Assistant') ? 'none' : '';
-      });
-      document.getElementById('unlockBtnWrap').style.display = unlocked ? 'none' : '';
-      var gw = document.getElementById('godModeWrap');
-      if (gw) gw.style.display = unlocked ? '' : 'none';
-      if (!unlocked && typeof switchView === 'function') switchView('chat');
-    }
-    window.openUnlockModal = function() {
-      document.getElementById('unlockOverlay').style.display = 'flex';
-      document.getElementById('unlockErr').style.display = 'none';
-      var input = document.getElementById('unlockInput');
-      input.value = ''; setTimeout(function(){ input.focus(); }, 80);
-    };
-    window.closeUnlockModal = function() { document.getElementById('unlockOverlay').style.display = 'none'; };
-    window.attemptUnlock = function() {
-      var input = document.getElementById('unlockInput');
-      if (input.value === CORRECT_PWD) {
-        sessionStorage.setItem(UNLOCK_KEY, '1');
-        closeUnlockModal();
-        applyLockState();
-        if (typeof switchView === 'function') switchView('ss-overview');
-      } else {
-        document.getElementById('unlockErr').style.display = '';
-        input.value = ''; input.focus();
-      }
-    };
-    document.addEventListener('DOMContentLoaded', function() { applyLockState(); });
-  })();
-  </script>
 </main>
 
-<!-- Language Preference Setup Modal -->
-<div class="lpm-overlay" id="langPrefModal">
-  <div class="lpm-card">
-    <div class="lpm-head">
-      <div class="lpm-head-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3zm7 9a7 7 0 01-14 0m7 7v4m-4 0h8"/></svg>
-      </div>
-      <div>
-        <div class="lpm-title">Set Your Voice Language</div>
-        <div class="lpm-sub">One-time preference &mdash; saved to your profile</div>
-      </div>
-    </div>
-    <div class="lpm-body">
-      <div class="lpm-info">
-        <strong>English (IN)</strong> + <strong>Hindi</strong> are always active.<br>
-        Choose your <strong>3rd regional language</strong> &mdash; we'll listen for all 3 simultaneously.
-      </div>
-      <div class="lpm-label">Your 3rd Language</div>
-      <div class="lpm-grid" id="langPrefGrid">
-        <button class="lpm-chip selected" data-lang="ta-IN">Tamil</button>
-        <button class="lpm-chip" data-lang="te-IN">Telugu</button>
-        <button class="lpm-chip" data-lang="kn-IN">Kannada</button>
-        <button class="lpm-chip" data-lang="ml-IN">Malayalam</button>
-        <button class="lpm-chip" data-lang="mr-IN">Marathi</button>
-        <button class="lpm-chip" data-lang="gu-IN">Gujarati</button>
-        <button class="lpm-chip" data-lang="pa-IN">Punjabi</button>
-        <button class="lpm-chip" data-lang="bn-IN">Bengali</button>
-        <button class="lpm-chip" data-lang="ur-IN">Urdu</button>
-      </div>
-    </div>
-    <div class="lpm-foot">
-      <button class="lpm-save-btn" id="langPrefSaveBtn">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3zm7 9a7 7 0 01-14 0m7 7v4m-4 0h8"/></svg>
-        Save &amp; Start Recording
-      </button>
-    </div>
-  </div>
-</div>
+<script>
+(function () {
+  /* ── Staff selector (public /api/staff) ─────────────────────── */
+  async function fetchStaff() {
+    try {
+      const resp = await fetch('/api/staff');
+      const data = await resp.json();
+      const sel = document.getElementById('staffUid');
+      if (!data.staff || !data.staff.length) {
+        sel.innerHTML = '<option value="">No staff found</option>';
+        return;
+      }
+      sel.innerHTML = '<option value="">Select Staff...</option>';
+      data.staff.forEach(function (s) {
+        const opt = document.createElement('option');
+        opt.value = s.userid;
+        opt.textContent = (s.name ? String(s.name).trim() : 'Unknown') + ' (' + (s.employee_code || String(s.userid).slice(0, 8)) + ')';
+        sel.appendChild(opt);
+      });
+      const autoUid = localStorage.getItem('dms_staff_uid');
+      if (autoUid && data.staff.find(function (s) { return s.userid === autoUid; })) sel.value = autoUid;
+      if (window.mountNativeChat) window.mountNativeChat();
+    } catch (e) {
+      console.error('Failed to load staff', e);
+      document.getElementById('staffUid').innerHTML = '<option value="">Error loading staff</option>';
+    }
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('staffUid').addEventListener('change', function () {
+      localStorage.setItem('dms_staff_uid', this.value || '');
+      if (window.mountNativeChat) window.mountNativeChat();
+    });
+    document.getElementById('ncMenuBtn').addEventListener('click', function () {
+      document.getElementById('ncRail').classList.toggle('nc-rail--hidden');
+    });
+    fetchStaff();
+  });
+})();
+</script>
 
-<script src="/static/app.js"></script>
+<script>
+(function () {
+  /* ── BI ON/OFF mode selector ────────────────────────────────── */
+  var btn = document.getElementById('aiAnalyticsToggle');
+  if (!btn) return;
+  function paint() {
+    var on = localStorage.getItem('dms_ai_analytics') === '1';
+    document.getElementById('aiAnalyticsState').innerHTML = on
+      ? 'ON &mdash; AI Narrative'
+      : 'OFF &mdash; Direct BI';
+    btn.classList.toggle('nc-toggle--on', on);
+  }
+  btn.addEventListener('click', function () {
+    localStorage.setItem('dms_ai_analytics', localStorage.getItem('dms_ai_analytics') === '1' ? '0' : '1');
+    paint();
+    window.dispatchEvent(new CustomEvent('dms-ai-analytics-changed'));
+  });
+  paint();
+})();
+</script>
+
+<!-- ── Native AI Chat loader (password-gated /d3, like SFA) ─────── -->
+<script>
+(function () {
+  var _mounted = false;
+  var _nativeChatEnabled = null;
+
+  function _sessionUid() {
+    // X-UID must be a registered DMS session UUID (set by the host integration,
+    // or passed as ?xuid=...). Falls back to the selected staff UID.
+    var q = new URLSearchParams(location.search).get('xuid');
+    var staff = (document.getElementById('staffUid') || {}).value || '';
+    return (q || localStorage.getItem('dms_session_uid') || staff || '').trim();
+  }
+
+  function _props() {
+    var staff = (document.getElementById('staffUid') || {}).value || '';
+    var ai = localStorage.getItem('dms_ai_analytics') === '1';
+    return { isMaximized: true, user: {
+      // Same-origin API so the native-chat gate's Basic credentials apply.
+      dmsAiBaseUrl: window.location.origin,
+      isEazyAiEnabled: true,
+      "X-UID": _sessionUid(),
+      "U-UID": staff,
+      "x-uid": _sessionUid(),
+      "x-staff-uid": staff,
+      "x-ai-analytics": ai
+    } };
+  }
+
+  function mountNativeChat() {
+    if (!window.__DMS_CHAT_MODULE__ || !_nativeChatEnabled) return;
+    var rootEl = document.getElementById('nativeChatRoot');
+    if (!rootEl) return;
+    var staff = (document.getElementById('staffUid') || {}).value || '';
+    rootEl._root = rootEl._root || ReactDOM.createRoot(rootEl);
+    if (!staff) {
+      rootEl._root.render(React.createElement('div', { className: 'native-chat-loading' },
+        'Select a staff member from the dropdown to start chatting with Owzy.'));
+      return;
+    }
+    rootEl._root.render(React.createElement(window.__DMS_CHAT_MODULE__.default, _props()));
+  }
+  window.mountNativeChat = mountNativeChat;
+
+  function showDisabled() {
+    var rootEl = document.getElementById('nativeChatRoot');
+    if (rootEl) {
+      rootEl.innerHTML =
+        '<div class="native-chat-loading" style="flex-direction:column;">' +
+          '<strong style="font-size:17px;color:#101828;">Native chat is turned off</strong>' +
+          '<div style="max-width:420px;line-height:1.6;">This embedded chat has been disabled. Please use the main application instead.</div>' +
+        '</div>';
+    }
+  }
+
+  function loadAndCompile() {
+    if (_mounted) return;
+    _mounted = true;
+    window.require = function (mod) {
+      if (mod === 'react' || mod === 'react/jsx-runtime') return window.React;
+      if (mod === 'react-dom' || mod === 'react-dom/client') return window.ReactDOM;
+      if (/\.(png|jpe?g|gif|svg|webp|avif|ico)$/i.test(mod)) return '/d3/' + mod.split('/').pop();
+      return {};
+    };
+    var SRC = ['/d3/DMSAIChat.jsx'];
+    fetch(SRC[0], { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + SRC[0]); return r.text(); })
+      .then(function (src) {
+        var compiled = Babel.transform(src, {
+          filename: 'DMSAIChat.jsx',
+          presets: [['react', { runtime: 'classic' }]],
+          plugins: ['transform-modules-commonjs']
+        }).code;
+        var mod = { exports: {} };
+        (new Function('require', 'module', 'exports', compiled))(window.require, mod, mod.exports);
+        window.__DMS_CHAT_MODULE__ = mod.exports;
+        mountNativeChat();
+      })
+      .catch(function (err) {
+        document.getElementById('nativeChatRoot').innerHTML =
+          '<div style="padding:40px;color:#dc2626;font-family:monospace;font-size:13px;">' +
+          '<strong>Chat load error:</strong><br>' + err.message + '</div>';
+        console.error('[DMSAIChat] load error:', err);
+      });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    fetch('/api/native-chat/status')
+      .then(function (r) { return r.ok ? r.json() : { enabled: false }; })
+      .catch(function () { return { enabled: false }; })
+      .then(function (st) {
+        _nativeChatEnabled = !!(st && st.enabled);
+        window.addEventListener('dms-ai-analytics-changed', mountNativeChat);
+        if (_nativeChatEnabled) loadAndCompile();
+        else showDisabled();
+      });
+  });
+})();
+</script>
 </body>
-
 </html>

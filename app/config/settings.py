@@ -63,6 +63,13 @@ class Settings:
     # Static
     STATIC_DIR: Path = Path(__file__).resolve().parent.parent / "static"
 
+    # Native (d3 test harness) chat. When False: /d3/DMSAIChat.jsx and /dmsai
+    # return 404 and only the main application works. Access is additionally
+    # protected by HTTP Basic Auth (see services/native_gate.py).
+    NATIVE_CHAT_ENABLED: bool = os.environ.get(
+        "NATIVE_CHAT_ENABLED", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
     def has_gemini_key(self) -> bool:
         return bool((self.GEMINI_API_KEY or "").strip())
 

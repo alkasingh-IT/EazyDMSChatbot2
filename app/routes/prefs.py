@@ -99,3 +99,44 @@ async def set_output_lang(req: Request) -> Dict[str, Any]:
 
     saved = UserPrefsService.set_output_lang(resolved, lang)
     return {"ok": True, "uid": resolved, "lang": saved}
+
+
+@router.get("/output-script")
+async def get_output_script(
+    req: Request,
+    uid: Optional[str] = None,
+    x_staff_uid: Optional[str] = Header(None),
+    x_uid: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    resolved = _resolve_pref_uid(req, x_staff_uid=x_staff_uid, x_uid=x_uid)
+    if not resolved:
+        raise HTTPException(status_code=401, detail="Valid registered session or staff UID required")
+    return {
+        "ok": True,
+        "uid": resolved,
+        "script": UserPrefsService.get_output_script(resolved),
+        "available_scripts": [
+            {"code": "native", "label": "Native Script (e.g. हिन्दी, தமிழ்)"},
+            {"code": "roman", "label": "Roman Script (e.g. Hinglish, Tanglish)"},
+        ],
+    }
+
+
+@router.post("/output-script")
+async def set_output_script(req: Request) -> Dict[str, Any]:
+    try:
+        payload = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    resolved = _resolve_pref_uid(req, payload=payload)
+    if not resolved:
+        raise HTTPException(status_code=401, detail="Valid registered session or staff UID required")
+
+    script = str((payload or {}).get("script") or "").strip().lower()
+    if script not in {"native", "roman"}:
+        raise HTTPException(status_code=422, detail="Invalid script. Valid: ['native', 'roman']")
+
+    saved = UserPrefsService.set_output_script(resolved, script)
+    return {"ok": True, "uid": resolved, "script": saved}
+

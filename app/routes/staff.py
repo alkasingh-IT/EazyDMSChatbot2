@@ -3,14 +3,20 @@ DMS Staff Route — lists available staff users from location_access_detail.
 GET  /api/staff  — list all distinct userids (for the staff selector)
 """
 from fastapi import APIRouter
-from ..db import run_query
+from ..db import run_query, allow_default_db
 
 router = APIRouter(prefix="/api")
 
 
 @router.get("/staff")
 async def list_staff():
-    """Return all staff users available in location_access_detail."""
+    """Return all staff users available in location_access_detail.
+
+    Public master-list helper used by the chat's staff selector. There is no
+    per-user session for this call, so it is an EXPLICIT, read-only exception
+    allowed to use the default DB.
+    """
+    allow_default_db.set(True)
     result = run_query("""
         SELECT DISTINCT
             u.id AS userid,

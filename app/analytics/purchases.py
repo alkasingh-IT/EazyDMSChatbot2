@@ -82,9 +82,16 @@ def p4_by_category(userid, params=None):
 
 
 def p5_item_history(userid, params=None):
-    p = params or {}; item_id = p.get("item_id", ""); _limit = p.get("limit", 100)
+    p = params or {}; _limit = p.get("limit", 100)
     df = _date_filter("td.vch_date", p); rbac = rbac_clause(p); qp = build_params(userid, p)
-    qp["item_id"] = str(item_id)
+    item_id = str(p.get("item_id") or p.get("item_code") or "").strip()
+    item_name = str(p.get("item_name") or p.get("query") or "").strip()
+    if not item_id and not item_name:
+        return {"rows": [], "columns": [], "row_count": 0, "error": "Provide item_name (or item_id/item_code)"}
+    qp["item_id"] = item_id
+    qp["item_name"] = f"%{item_name}%"
+    id_match = "(CAST(td.itemid AS TEXT) = :item_id OR itm.itemcode = :item_id)" if item_id else "FALSE"
+    name_match = "itm.itemdescription ILIKE :item_name" if item_name else "FALSE"
     return run_query(f"""
         SELECT td.vch_no, td.vch_date, ds.ledgercode AS ds_code, ds.ledgername AS ds_name,
                itm.itemcode, itm.itemdescription AS item_name,
@@ -93,7 +100,7 @@ def p5_item_history(userid, params=None):
         INNER JOIN ({rbac}) accd ON accd.locationid = td.distributorid
         JOIN ledgermaster ds ON ds.ledgerid = td.distributorid AND ds.ledgertype = 1
         JOIN itemmaster itm ON itm.itemid = td.itemid
-        WHERE (CAST(td.itemid AS TEXT) = :item_id OR itm.itemcode = :item_id) AND LOWER(td.trn_type)='purchase'
+        WHERE ({id_match} OR {name_match}) AND LOWER(td.trn_type)='purchase'
           AND td.iscancelled IS DISTINCT FROM TRUE AND td.isdeleted IS DISTINCT FROM TRUE {df}
         ORDER BY td.vch_date DESC LIMIT {_limit}
     """, qp)
@@ -222,8 +229,14 @@ def p10_reconciliation(userid, params=None):
 
 def p12_compare_periods(userid, params=None):
     p = params or {}; rbac = rbac_clause(p); qp = build_params(userid, p)
-    if p.get("date_from") and p.get("date_to"):
-        from datetime import datetime, timedelta
+    from datetime import datetime, timedelta
+    if p.get("date_from_1") and p.get("date_to_1") and p.get("date_from_2") and p.get("date_to_2"):
+        # Router style: BOTH periods supplied explicitly (e.g. Q1 vs Q2)
+        qp["cur_from"] = str(p["date_from_1"]); qp["cur_to"] = str(p["date_to_1"])
+        qp["prev_from"] = str(p["date_from_2"]); qp["prev_to"] = str(p["date_to_2"])
+        df = "AND td.vch_date >= :cur_from AND td.vch_date < :cur_to"
+        df_prev = "AND td.vch_date >= :prev_from AND td.vch_date < :prev_to"
+    elif p.get("date_from") and p.get("date_to"):
         d_from = datetime.strptime(str(p["date_from"]), "%Y-%m-%d").date()
         d_to = datetime.strptime(str(p["date_to"]), "%Y-%m-%d").date()
         span = (d_to - d_from).days + 1
@@ -583,11 +596,23 @@ def p26_pareto(userid, params=None):
 def p27_distributor_compare(userid, params=None):
     p = params or {}; df = _date_filter("td.vch_date", p); rbac = rbac_clause(p); qp = build_params(userid, p)
     ids = str(p.get("distributor_ids", "")).strip()
-    if not ids:
-        return {"rows": [], "columns": ["ds_code", "ds_name", "total", "invoices"], "row_count": 0, "error": "Provide distributor_ids (comma-separated)"}
-    placeholders = ",".join(f":did{i}" for i, _ in enumerate(ids.split(",")))
-    for i, did in enumerate(x.strip() for x in ids.split(",") if x.strip()):
+    names = str(p.get("distributor_names", "")).strip()
+    if not ids and not names:
+        return {"rows": [], "columns": ["ds_code", "ds_name", "total", "invoices"], "row_count": 0, "error": "Provide distributor_ids or distributor_names (comma-separated)"}
+    id_list = [x.strip() for x in ids.split(",") if x.strip()] if ids else []
+    name_list = [x.strip() for x in names.split(",") if x.strip()] if names else []
+    id_ph = ",".join(f":did{i}" for i in range(len(id_list)))
+    name_ph = ",".join(f":dname{i}" for i in range(len(name_list)))
+    for i, did in enumerate(id_list):
         qp[f"did{i}"] = did
+    for i, nm in enumerate(name_list):
+        qp[f"dname{i}"] = nm
+    if id_list and name_list:
+        match_sql = f"(CAST(td.distributorid AS TEXT) IN ({id_ph}) OR ds.ledgercode IN ({id_ph}) OR ds.ledgername IN ({name_ph}))"
+    elif id_list:
+        match_sql = f"(CAST(td.distributorid AS TEXT) IN ({id_ph}) OR ds.ledgercode IN ({id_ph}))"
+    else:
+        match_sql = f"ds.ledgername IN ({name_ph})"
     return run_query(f"""
         SELECT ds.ledgercode AS ds_code, ds.ledgername AS ds_name, SUM(td.billed_value) AS total,
                COUNT(DISTINCT td.vch_no) AS invoices,
@@ -596,7 +621,7 @@ def p27_distributor_compare(userid, params=None):
         FROM transactiondetail td INNER JOIN ({rbac}) accd ON accd.locationid=td.distributorid
         JOIN ledgermaster ds ON ds.ledgerid = td.distributorid AND ds.ledgertype = 1
         WHERE LOWER(td.trn_type)='purchase' AND td.iscancelled IS DISTINCT FROM TRUE AND td.isdeleted IS DISTINCT FROM TRUE
-          AND (CAST(td.distributorid AS TEXT) IN ({placeholders}) OR ds.ledgercode IN ({placeholders})) {df}
+          AND {match_sql} {df}
         GROUP BY ds.ledgercode, ds.ledgername ORDER BY total DESC
     """, qp)
 
@@ -768,7 +793,7 @@ PURCHASES_FLAGS = {
     "pur:this-month":       (p1_this_month,      "Purchase entries for this month"),
     "pur:last-quarter":     (p2_last_quarter,    "Total purchase value last quarter"),
     "pur:pending":          (p3_pending,         "Pending/unmatched purchase entries"),
-    "pur:by-category":      (p4_by_category,     "Purchases by item category this month"),
+    "pur:by-category":      (p4_by_category,     "Purchases by item category (date-range aware via date_from/date_to; defaults to this month)"),
     "pur:item-history":     (p5_item_history,    "Purchase history for a specific item (last 3 months)"),
     "pur:variance":         (p6_variance,        "Variance between Tally purchases and DMS primary sales"),
     "pur:by-distributor":   (p7_by_distributor,  "Purchases for all distributors in area [ASM+]"),

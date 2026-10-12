@@ -34,3 +34,10 @@ __pycache__/
 # Python caches
 __pycache__/
 *.py[cod]
+
+# UAT historical backups
+app/.backup_pre_upgrade_*/
+
+# UAT historical backups
+app/.backup_pre_upgrade_*/
+app/services/native_chat_access.json

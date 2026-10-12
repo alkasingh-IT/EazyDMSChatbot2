@@ -231,93 +231,19 @@ def _find_col(candidates: List[str], cols_map: Dict[str, str]) -> Optional[str]:
 
 def _classify_and_fuse_datasets(
     executed_data: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, float]]:
+    module_hint: str = "",
+) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, float], Dict[str, bool]]:
     """
-    Classifies datasets into dim_ds (breakdown) vs summary_ds (aggregate).
-    Overlays authoritative totals from summary_ds onto breakdown rows.
+    Layer 2 — select ONE report module and derive verified metrics from it.
+
+    Returns (primary_rows, primary_cols, kpis, metric_valid). Every headline
+    metric comes from a single module via the metric guard, so a summary row can
+    never be fused with an unrelated breakdown and produce a mismatched number.
     """
-    valid_datasets = [
-        ds for ds in (executed_data or [])
-        if isinstance(ds, dict) and not ds.get("error") and (ds.get("rows") or ds.get("rows_full"))
-    ]
-
-    if not valid_datasets:
-        return [], [], {}
-
-    def _get_rows(ds: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return ds.get("rows") or ds.get("rows_full") or []
-
-    def _get_cols(ds: Dict[str, Any]) -> List[str]:
-        cols = ds.get("columns") or []
-        if not cols and _get_rows(ds):
-            cols = list(_get_rows(ds)[0].keys())
-        return [c for c in cols if not c.startswith("_")]
-
-    if len(valid_datasets) == 1:
-        single_ds = valid_datasets[0]
-        rows = _get_rows(single_ds)
-        cols = _get_cols(single_ds)
-        cols_map = {c.lower(): c for c in cols}
-
-        # Check if single dataset is summary-only
-        v_col = _find_col(VAL_COL_CANDIDATES, cols_map)
-        q_col = _find_col(QTY_COL_CANDIDATES, cols_map)
-        n_col = _find_col(ENTITY_NAME_CANDIDATES, cols_map)
-        summary_kpis: Dict[str, float] = {}
-        if len(rows) == 1 and not n_col:
-            r0 = rows[0]
-            if v_col:
-                summary_kpis["total_val"] = _safe_float(r0.get(v_col))
-            if q_col:
-                summary_kpis["total_qty"] = _safe_float(r0.get(q_col))
-        return rows, cols, summary_kpis
-
-    dim_ds: Optional[Dict[str, Any]] = None
-    summary_ds: Optional[Dict[str, Any]] = None
-
-    for ds in valid_datasets:
-        rows = _get_rows(ds)
-        cols = _get_cols(ds)
-        cols_map = {c.lower(): c for c in cols}
-        name_col = _find_col(ENTITY_NAME_CANDIDATES, cols_map)
-        val_col = _find_col(VAL_COL_CANDIDATES, cols_map)
-
-        # Summary criteria: single row and no entity name column, or explicit summary column names
-        is_summary = (len(rows) == 1 and not name_col) or any(
-            k in cols_map for k in ("totalsales", "totalpurchases", "grandtotal", "totalamount")
-        )
-        is_dim = len(rows) > 1 and name_col is not None
-
-        if is_dim and dim_ds is None:
-            dim_ds = ds
-        elif is_summary and summary_ds is None:
-            summary_ds = ds
-
-    summary_kpis = {}
-    if summary_ds:
-        s_rows = _get_rows(summary_ds)
-        if s_rows:
-            r0 = s_rows[0]
-            s_cols = {c.lower(): c for c in _get_cols(summary_ds)}
-            v_col = _find_col(VAL_COL_CANDIDATES, s_cols)
-            q_col = _find_col(QTY_COL_CANDIDATES, s_cols)
-            inv_col = _find_col(INV_COUNT_CANDIDATES, s_cols)
-            out_col = _find_col(OUTLET_COUNT_CANDIDATES, s_cols)
-
-            if v_col and v_col in r0:
-                summary_kpis["total_val"] = _safe_float(r0[v_col])
-            if q_col and q_col in r0:
-                summary_kpis["total_qty"] = _safe_float(r0[q_col])
-            if inv_col and inv_col in r0:
-                summary_kpis["invoice_count"] = int(_safe_float(r0[inv_col]))
-            if out_col and out_col in r0:
-                summary_kpis["unique_outlets"] = int(_safe_float(r0[out_col]))
-
-    primary = dim_ds or summary_ds or valid_datasets[0]
-    primary_rows = _get_rows(primary)
-    primary_cols = _get_cols(primary)
-
-    return primary_rows, primary_cols, summary_kpis
+    primary_rows, primary_cols, kpis, metric_valid, _flag = _resolve_report_datasets(
+        executed_data, module_hint
+    )
+    return primary_rows, primary_cols, kpis, metric_valid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +288,7 @@ class ComputedAnalytics:
     advanced: AdvancedMetrics
     module: str
     time_str: str
+    metric_valid: Dict[str, bool] = dataclasses.field(default_factory=dict)
 
 
 def _compute_advanced_metrics(
@@ -470,14 +397,182 @@ def _compute_advanced_metrics(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# METRIC GUARD — single-source, verified metrics (never mix scopes)
+# ─────────────────────────────────────────────────────────────────────────────
+# The Direct-BI report must never show a number that cannot be traced to ONE
+# dataset and that disagrees with the table rendered below it. A summary row is
+# only trusted when it belongs to the SAME module as the breakdown AND agrees
+# with the row-derived value within tolerance. Otherwise the row-derived value
+# wins (it matches the table), and a metric with no source is omitted.
+
+_METRIC_TOLERANCE = 0.02  # 2%
+
+
+def _module_of(flag: Any) -> str:
+    """'sc:dead-count' → 'sc'."""
+    return str(flag or "").split(":")[0].strip().lower()
+
+
+def _dataset_rows(ds: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return ds.get("rows") or ds.get("rows_full") or []
+
+
+def _dataset_cols(ds: Dict[str, Any]) -> List[str]:
+    cols = ds.get("columns") or []
+    if not cols and _dataset_rows(ds):
+        first = _dataset_rows(ds)[0]
+        if isinstance(first, dict):
+            cols = list(first.keys())
+    return [c for c in cols if c and not str(c).startswith("_")]
+
+
+def _has_entity_col(cols: List[str]) -> bool:
+    norms = {re.sub(r"[_\-\s]", "", c.lower()) for c in ENTITY_NAME_CANDIDATES}
+    col_norms = {re.sub(r"[_\-\s]", "", str(c).lower()) for c in cols}
+    return bool(norms & col_norms)
+
+
+def _extract_dataset_metrics(ds: Dict[str, Any]) -> Tuple[Dict[str, float], bool]:
+    """Return (metrics, is_summary) for ONE dataset.
+
+    is_summary = a single aggregate row that is NOT an entity breakdown.
+    """
+    rows = _dataset_rows(ds)
+    if not rows:
+        return {}, False
+    cols = _dataset_cols(ds)
+    cols_map = {c.lower(): c for c in cols}
+    val_col = _find_col(VAL_COL_CANDIDATES, cols_map)
+    qty_col = _find_col(QTY_COL_CANDIDATES, cols_map)
+    inv_col = _find_col(INV_COUNT_CANDIDATES, cols_map)
+    out_col = _find_col(OUTLET_COUNT_CANDIDATES, cols_map)
+    is_summary = len(rows) == 1 and not _has_entity_col(cols)
+
+    m: Dict[str, float] = {}
+    if is_summary:
+        r0 = rows[0]
+        if val_col: m["total_val"] = _safe_float(r0.get(val_col))
+        if qty_col: m["total_qty"] = _safe_float(r0.get(qty_col))
+        if inv_col: m["invoice_count"] = _safe_float(r0.get(inv_col))
+        if out_col: m["unique_outlets"] = _safe_float(r0.get(out_col))
+    else:
+        if val_col: m["total_val"] = sum(_safe_float(r.get(val_col)) for r in rows)
+        if qty_col: m["total_qty"] = sum(_safe_float(r.get(qty_col)) for r in rows)
+        if inv_col: m["invoice_count"] = sum(_safe_float(r.get(inv_col)) for r in rows)
+        if out_col: m["unique_outlets"] = float(len({_clean_str(r.get(out_col)) for r in rows if r.get(out_col)}))
+    return m, is_summary
+
+
+def _resolve_report_datasets(
+    executed_data: List[Dict[str, Any]],
+    module_hint: str = "",
+) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, float], Dict[str, bool], str]:
+    """
+    Pick ONE report module/flag and derive every headline metric from it alone.
+
+    Returns (primary_rows, primary_cols, kpis, metric_valid, primary_flag).
+    """
+    valid_ds = [
+        ds for ds in (executed_data or [])
+        if isinstance(ds, dict) and not ds.get("error") and _dataset_rows(ds)
+    ]
+    if not valid_ds:
+        return [], [], {}, {}, ""
+
+    by_module: Dict[str, List[Dict[str, Any]]] = {}
+    for ds in valid_ds:
+        by_module.setdefault(_module_of(ds.get("flag")), []).append(ds)
+
+    def _breakdown_rows(dss: List[Dict[str, Any]]) -> int:
+        best = 0
+        for d in dss:
+            _m, is_sum = _extract_dataset_metrics(d)
+            if not is_sum:
+                best = max(best, len(_dataset_rows(d)))
+        return best
+
+    report_module = ""
+    if module_hint and module_hint in by_module and _breakdown_rows(by_module[module_hint]) > 0:
+        report_module = module_hint
+    else:
+        report_module = max(
+            by_module,
+            key=lambda m: (_breakdown_rows(by_module[m]),
+                           sum(len(_dataset_rows(d)) for d in by_module[m])),
+        )
+    ds_group = by_module.get(report_module, [])
+
+    breakdowns = [d for d in ds_group if not _extract_dataset_metrics(d)[1]]
+    summaries = [d for d in ds_group if _extract_dataset_metrics(d)[1]]
+    if breakdowns:
+        primary = max(breakdowns, key=lambda d: len(_dataset_rows(d)))
+    elif summaries:
+        primary = summaries[0]
+    else:
+        primary = ds_group[0]
+
+    primary_rows = _dataset_rows(primary)
+    primary_cols = _dataset_cols(primary)
+    primary_is_summary = _extract_dataset_metrics(primary)[1]
+    row_metrics, _ = _extract_dataset_metrics(primary)
+    sum_metrics, _ = (_extract_dataset_metrics(summaries[0]) if summaries else ({}, True))
+
+    kpis: Dict[str, float] = {}
+    valid: Dict[str, bool] = {}
+
+    for metric in ("total_val", "total_qty", "invoice_count", "unique_outlets"):
+        rv = row_metrics.get(metric)
+        sv = sum_metrics.get(metric)
+        if rv is None and sv is None:
+            valid[metric] = False
+            continue
+        if primary_is_summary:
+            kpis[metric] = rv
+            valid[metric] = True
+            continue
+        if rv is not None and rv != 0:
+            if sv is not None and sv != 0:
+                diff = abs(sv - rv) / max(abs(rv), 1e-9)
+                if diff <= _METRIC_TOLERANCE:
+                    kpis[metric] = sv  # agree → summary authoritative
+                else:
+                    print(f"[exec-report] metric '{metric}' using row-derived {rv} "
+                          f"(summary {sv} disagreed by {diff * 100:.1f}%)")
+                    kpis[metric] = rv
+            else:
+                kpis[metric] = rv
+            valid[metric] = True
+        elif sv is not None:
+            kpis[metric] = sv
+            valid[metric] = True
+        else:
+            valid[metric] = False
+
+    # invoice_count must NEVER be the number of breakdown rows (those are
+    # entities, not bills). If there is no explicit count, omit it.
+    if not primary_is_summary and "invoice_count" not in kpis:
+        valid["invoice_count"] = False
+
+    return primary_rows, primary_cols, kpis, valid, str(primary.get("flag") or "")
+
+
 def _compute_analytics(
     rows: List[Dict[str, Any]],
     cols: List[str],
     summary_kpis: Dict[str, float],
     module: str,
     time_str: str,
+    metric_valid: Optional[Dict[str, bool]] = None,
 ) -> ComputedAnalytics:
-    """Transforms raw DB rows into an enriched analytical object."""
+    """Transforms raw DB rows into an enriched analytical object.
+
+    Headline metrics are taken from `summary_kpis` ONLY when the metric guard
+    marked them valid (single, self-consistent source). Invalid metrics fall
+    back to the row-derived value (often 0, so display gates omit them). This
+    guarantees a shown number never contradicts the table rendered below it.
+    """
+    metric_valid = metric_valid or {}
     cols_map = {c.lower(): c for c in cols}
     val_col = _find_col(VAL_COL_CANDIDATES, cols_map)
     qty_col = _find_col(QTY_COL_CANDIDATES, cols_map)
@@ -486,20 +581,17 @@ def _compute_analytics(
     inv_col = _find_col(INV_COUNT_CANDIDATES, cols_map)
     out_col = _find_col(OUTLET_COUNT_CANDIDATES, cols_map)
 
-    # 1. Authoritative Totals
-    if "total_val" in summary_kpis:
-        total_val = summary_kpis["total_val"]
-    elif val_col:
-        total_val = sum(_safe_float(r.get(val_col)) for r in rows)
-    else:
-        total_val = 0.0
+    raw_total_val = sum(_safe_float(r.get(val_col)) for r in rows) if val_col else 0.0
+    raw_total_qty = sum(_safe_float(r.get(qty_col)) for r in rows) if qty_col else 0.0
 
-    if "total_qty" in summary_kpis:
-        total_qty = summary_kpis["total_qty"]
-    elif qty_col:
-        total_qty = sum(_safe_float(r.get(qty_col)) for r in rows)
-    else:
-        total_qty = 0.0
+    def _resolved(name: str, raw: float) -> float:
+        if name in summary_kpis and metric_valid.get(name, True):
+            return _safe_float(summary_kpis[name])
+        return raw
+
+    # 1. Authoritative Totals (single source, verified)
+    total_val = _resolved("total_val", raw_total_val)
+    total_qty = _resolved("total_qty", raw_total_qty)
 
     # 2. Entity ranking & shares
     entity_map: Dict[str, Dict[str, Any]] = {}
@@ -543,16 +635,18 @@ def _compute_analytics(
     else:
         concentration_risk = "BALANCED"
 
-    # 4. Invoice & outlet counts
-    if "invoice_count" in summary_kpis:
-        inv_count = int(summary_kpis["invoice_count"])
+    # 4. Invoice & outlet counts (verified single-source; never count breakdown rows as orders)
+    if "invoice_count" in summary_kpis and metric_valid.get("invoice_count", True):
+        inv_count = int(_safe_float(summary_kpis["invoice_count"]))
     elif inv_col:
         inv_count = int(sum(_safe_float(r.get(inv_col)) for r in rows))
-    else:
+    elif not _has_entity_col(cols):
         inv_count = len(rows)
+    else:
+        inv_count = 0
 
-    if "unique_outlets" in summary_kpis:
-        unique_outlets = int(summary_kpis["unique_outlets"])
+    if "unique_outlets" in summary_kpis and metric_valid.get("unique_outlets", True):
+        unique_outlets = int(_safe_float(summary_kpis["unique_outlets"]))
     elif out_col:
         unique_outlets = len({r.get(out_col) for r in rows if r.get(out_col)})
     else:
@@ -581,6 +675,7 @@ def _compute_analytics(
         advanced=advanced,
         module=module,
         time_str=time_str,
+        metric_valid=metric_valid,
     )
 
 
@@ -1256,12 +1351,12 @@ def _detect_module_type(flag_name: str, question: str, cols: List[str]) -> str:
         return "primary_sales"
     if f.startswith("sm") or "stock_movement" in f or "movement" in f:
         return "stock_movement"
+    if f.startswith("sch") or "scheme" in f:
+        return "schemes"
     if f.startswith("sc") or "clearance" in f or "expiry" in f:
         return "stock_clearance"
     if f.startswith("clm") or "claim" in f:
         return "claims"
-    if f.startswith("sch") or "scheme" in f:
-        return "schemes"
     if f.startswith("mst") or "master" in f:
         return "masters"
     if f.startswith("ss") or "secondary" in f:
@@ -1759,9 +1854,10 @@ def generate_executive_report(
         if cq_answer:
             return _clean_markdown_formatting(cq_answer)
 
-    # Layer 2: Classify & Fuse all datasets
+    # Layer 2: Classify & Fuse all datasets (single-source, verified metrics)
+    flag = first_flag or (descriptions[0][0] if descriptions else "")
     datasets_to_fuse = executed_data if executed_data else [merged_exec]
-    rows, cols, summary_kpis = _classify_and_fuse_datasets(datasets_to_fuse)
+    rows, cols, summary_kpis, metric_valid = _classify_and_fuse_datasets(datasets_to_fuse, _module_of(flag))
 
     # Fallback to merged_exec rows if classification yielded nothing
     if not rows and merged_exec:
@@ -1785,14 +1881,13 @@ def generate_executive_report(
         )
 
     # Detect module type
-    flag = first_flag or (descriptions[0][0] if descriptions else "")
     cols_map = {c.lower(): c for c in cols}
     time_col = _find_col(TIME_COL_CANDIDATES, cols_map)
     time_str = _extract_time_context(question, rows, time_col)
     mod_type = _detect_module_type(flag, question, cols)
 
     # Layer 3 & 3.5: Compute analytics
-    analytics = _compute_analytics(rows, cols, summary_kpis, mod_type, time_str)
+    analytics = _compute_analytics(rows, cols, summary_kpis, mod_type, time_str, metric_valid)
 
     # Layer 5: Push turn to conversation memory
     if staff_uid and conversation_id:
@@ -1802,6 +1897,715 @@ def generate_executive_report(
     config = _MODULE_CONFIGS.get(mod_type, _MODULE_CONFIGS["generic"])
     raw_briefing = _assemble_briefing(analytics, config, question)
     return _clean_markdown_formatting(raw_briefing)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BRANDED REPORT CARD (structured briefing payload) + CONCISE BI NARRATIVE
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MODULE_ICONS = {
+    "secondary_sales": "��", "purchases": "��", "primary_sales": "��",
+    "stock_movement": "��", "stock_clearance": "⏳", "claims": "��",
+    "schemes": "��", "masters": "��️", "generic": "��",
+}
+
+_MODULE_VALUE_LABELS = {
+    "secondary_sales": "Total Secondary Sales",
+    "purchases": "Total Purchase Value",
+    "primary_sales": "Total Primary Sales",
+    "stock_movement": "Inventory Position Value",
+    "stock_clearance": "Clearance Value",
+    "claims": "Claim Settlement Value",
+    "schemes": "Scheme Discount / Uplift",
+    "masters": "Commercial Volume",
+    "generic": "Total Value",
+}
+
+
+def _date_range_from_rows(rows: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """Scan rows for a date-ish column and return (min, max) ISO dates."""
+    if not rows:
+        return "", ""
+    candidates = []
+    for col in list(rows[0].keys()):
+        vals = []
+        for r in rows[:60]:
+            s = _clean_str(r.get(col))
+            if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+                vals.append(s[:10])
+        if len(vals) >= 2:
+            candidates.append((min(vals), max(vals)))
+    if candidates:
+        return min(c[0] for c in candidates), max(c[1] for c in candidates)
+    return "", ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIME-SERIES DETECTION & TREND REPORTING
+# ─────────────────────────────────────────────────────────────────────────────
+# Monthly / daily breakdowns are NOT an entity breakdown: ranking them as
+# "distributors" produces nonsense (General Entity 100%, fake concentration).
+# When the primary rows are a time series we report a TREND instead.
+
+def _find_time_col(rows: List[Dict[str, Any]], cols: List[str]) -> Optional[str]:
+    cols_map = {c.lower(): c for c in cols}
+    time_col = _find_col(TIME_COL_CANDIDATES, cols_map)
+    if time_col:
+        return time_col
+    for c in cols:
+        s = _clean_str((rows[0] or {}).get(c)) if rows else ""
+        if re.match(r"^\d{4}[-/]\d{2}", s):
+            return c
+    return None
+
+
+def _is_time_series(rows: List[Dict[str, Any]], cols: List[str]) -> bool:
+    """True when rows are a period breakdown with no real categorical entity."""
+    if len(rows) < 3:
+        return False
+    if not _find_time_col(rows, cols):
+        return False
+    cols_map = {c.lower(): c for c in cols}
+    name_col = _find_col(ENTITY_NAME_CANDIDATES, cols_map)
+    if name_col:
+        distinct = {_clean_str(r.get(name_col)) for r in rows[:50] if r.get(name_col)}
+        if len(distinct) > 1:
+            return False
+    return True
+
+
+def _time_series_points(rows: List[Dict[str, Any]], cols: List[str]) -> List[Tuple[str, float, float]]:
+    """(period_label, value, qty) sorted chronologically."""
+    time_col = _find_time_col(rows, cols)
+    if not time_col:
+        return []
+    cols_map = {c.lower(): c for c in cols}
+    val_col = _find_col(VAL_COL_CANDIDATES, cols_map)
+    qty_col = _find_col(QTY_COL_CANDIDATES, cols_map)
+    pts: List[Tuple[str, float, float]] = []
+    for r in rows:
+        label = _clean_str(r.get(time_col))
+        if not label:
+            continue
+        pts.append((
+            label,
+            _safe_float(r.get(val_col)) if val_col else 0.0,
+            _safe_float(r.get(qty_col)) if qty_col else 0.0,
+        ))
+    pts.sort(key=lambda p: p[0])
+    return pts
+
+
+def _build_read_trend(analytics: ComputedAnalytics, config: ModuleConfig,
+                      pts: List[Tuple[str, float, float]]) -> str:
+    labels = [p[0] for p in pts]
+    vals = [p[1] for p in pts]
+    total = sum(vals)
+    n = len(pts)
+    peak_i = max(range(n), key=lambda i: vals[i])
+    low_i = min(range(n), key=lambda i: vals[i])
+    first, last = vals[0], vals[-1]
+    chg = ((last - first) / abs(first) * 100.0) if first else 0.0
+    qty_total = sum(p[2] for p in pts)
+
+    parts: List[str] = []
+    opening = (
+        f"Your **{config.domain_label.lower()}** for **{labels[0]} to {labels[-1]}** totals "
+        f"**{_fmt_inr(total)}**"
+    )
+    if qty_total > 0:
+        opening += f" across **{_fmt_num(qty_total)} units**"
+    opening += f" over **{n} periods**."
+    parts.append(opening)
+
+    if total > 0:
+        parts.append(
+            f"**{labels[peak_i]}** was the strongest period at **{_fmt_inr(vals[peak_i])}** "
+            f"({vals[peak_i] / total * 100:.1f}% of the total), while **{labels[low_i]}** was the softest "
+            f"at **{_fmt_inr(vals[low_i])}**."
+        )
+
+    direction = "up" if chg > 0.5 else ("down" if chg < -0.5 else "broadly flat")
+    parts.append(
+        f"First period vs last period the trend is **{direction} {abs(chg):.1f}%** "
+        f"({_fmt_inr(first)} → {_fmt_inr(last)})."
+    )
+    if total > 0:
+        parts.append(f"Average per period is **{_fmt_inr(total / n)}**.")
+    return "\n\n".join(parts)
+
+
+def _build_phase1_trend_briefing(analytics: ComputedAnalytics, config: ModuleConfig, question: str,
+                                 pts: List[Tuple[str, float, float]]) -> Dict[str, Any]:
+    """Branded card payload for a period breakdown (trend, not leaderboard)."""
+    labels = [p[0] for p in pts]
+    vals = [p[1] for p in pts]
+    qtys = [p[2] for p in pts]
+    total = sum(vals)
+    n = len(pts)
+    peak_i = max(range(n), key=lambda i: vals[i])
+    low_i = min(range(n), key=lambda i: vals[i])
+    first, last = vals[0], vals[-1]
+    chg = ((last - first) / abs(first) * 100.0) if first else 0.0
+    qty_total = sum(qtys)
+
+    tiles: List[Dict[str, str]] = [{"icon": "orders", "value": f"{n}", "label": "Periods"}]
+    if qty_total > 0:
+        tiles.append({"icon": "units", "value": _fmt_num(qty_total), "label": "Units"})
+    tiles.append({"icon": "value", "value": labels[peak_i], "label": "Peak period"})
+
+    ranked = sorted(pts, key=lambda p: p[1], reverse=True)
+    leaders: List[Dict[str, Any]] = []
+    for i, (label, v, q) in enumerate(ranked[:8]):
+        leaders.append({
+            "rank": i + 1,
+            "name": label,
+            "value": _fmt_inr(v),
+            "share": round((v / total * 100.0) if total > 0 else 0.0, 1),
+            "units": _fmt_num(q),
+        })
+
+    direction = "up" if chg > 0.5 else ("down" if chg < -0.5 else "flat")
+    standouts = [
+        {"icon": "trend", "title": f"Peak: {labels[peak_i]}",
+         "text": f"{_fmt_inr(vals[peak_i])} in this period — the highest of the range."},
+        {"icon": "pulse", "title": f"Trend: {direction}",
+         "text": f"First vs last period moved {chg:+.1f}% ({_fmt_inr(first)} → {_fmt_inr(last)})."},
+    ]
+    actions = [
+        {"icon": "shield", "title": f"Repeat the {labels[peak_i]} playbook",
+         "body": f"Study what drove {_fmt_inr(vals[peak_i])} in {labels[peak_i]} and apply it to weaker periods."},
+        {"icon": "spread", "title": f"Lift {labels[low_i]}",
+         "body": f"{labels[low_i]} was the softest at {_fmt_inr(vals[low_i])}; a targeted push here narrows the gap."},
+    ]
+    explore = [
+        f"Why did {labels[low_i]} dip?",
+        f"What if {labels[peak_i]} grew 20%?",
+        "Compare with the same period last year",
+        "Show the month-over-month change",
+    ]
+
+    date_from, date_to = labels[0], labels[-1]
+    return {
+        "title": _clean_question_title(question, config.domain_label),
+        "intro": f"{config.domain_label} trend over time",
+        "icon": _MODULE_ICONS.get(analytics.module, "��"),
+        "value": _fmt_inr(total) if total > 0 else "",
+        "value_label": _MODULE_VALUE_LABELS.get(analytics.module, f"Total {config.value_label}"),
+        "date_from": date_from,
+        "date_to": date_to,
+        "tiles": tiles[:4],
+        "biggest": {"label": "Peak period", "name": labels[peak_i], "share": round((vals[peak_i] / total * 100.0) if total > 0 else 0.0, 1)},
+        "leaders": leaders,
+        "tiers": [],
+        "standouts": standouts[:3],
+        "actions": actions[:3],
+        "explore": explore,
+        "avg_bits": [f"Avg. per period: {_fmt_inr(total / n)}"] if total > 0 else [],
+        "footnote": f"Trend computed from your own territory data for {labels[0]} to {labels[-1]}.",
+    }
+
+
+_CURRENT_PREV_PAIRS = [
+    # (side-A column, side-B column) — period-comparison datasets in DMS flags
+    ("current_total", "previous_total"),
+    ("current_month_sales", "last_month_sales"),
+    ("this_month_total", "last_month_total"),
+    ("current_value", "previous_value"),
+    ("this_period", "last_period"),
+]
+
+
+def _label_from_col(col: str) -> str:
+    """Factual side label derived from the data column itself."""
+    c = (col or "").lower()
+    if "current" in c or "this" in c:
+        return "Current period"
+    if "prev" in c or "last" in c:
+        return "Previous period"
+    return (col or "").replace("_", " ").title()[:40]
+
+
+def _build_dms_comparison_card(
+    question: str,
+    descriptions: Optional[List[Tuple[str, str]]],
+    executed_data: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Purpose-built compact diff card for comparison answers (à-la-carte, SFA-style).
+    Two supported data shapes — both read ONLY real executed values:
+      A) Period comparison (compare-periods / growth flags): ONE row with paired
+         current/previous columns → tiles [A, B, delta].
+      B) Entity comparison (distributor-compare): TWO rows with a name + value
+         column → tiles per entity + delta.
+    Returns {} when neither shape fits — caller falls back to the reduced card.
+    """
+    usable = [ds for ds in (executed_data or [])
+              if isinstance(ds, dict) and not ds.get("error")]
+    if not usable:
+        return {}
+    ds = usable[0]
+    rows = ds.get("rows_full") or ds.get("rows") or []
+    cols = ds.get("columns") or []
+    if not rows:
+        return {}
+
+    # ── Case A: paired current/previous columns in a single row ─────────────
+    if len(rows) == 1:
+        row = rows[0]
+        a_col = b_col = None
+        # explicit known pairs first
+        for ca, cb in _CURRENT_PREV_PAIRS:
+            if ca in cols and cb in cols:
+                a_col, b_col = ca, cb
+                break
+        if a_col is None:
+            # generic detection: base col + prev/last variant of the same base
+            lowered = {c.lower(): c for c in cols}
+            for c in cols:
+                cl = c.lower()
+                for tag in ("prev", "previous", "last"):
+                    if tag in cl:
+                        base = cl.replace(tag, "").replace("previous", "").replace("_", "_")
+                        cand = None
+                        for c2 in cols:
+                            c2l = c2.lower()
+                            if c2l != cl and (c2l in base or base.replace("_", "") == c2l.replace("_", "")):
+                                cand = c2
+                                break
+                        if cand:
+                            a_col, b_col = cand, c
+                            break
+                if a_col:
+                    break
+        if a_col and b_col is not None:
+            va = _safe_float(row.get(a_col))
+            vb = _safe_float(row.get(b_col))
+            label_a = _label_from_col(a_col)
+            label_b = _label_from_col(b_col)
+            # Prefer the flag's OWN stored change metric (its denominator is
+            # authoritative); fall back to computing the raw delta.
+            stored = None
+            for cand in ("change_pct", "growth_pct"):
+                if cand in cols and row.get(cand) is not None:
+                    stored = _safe_float(row.get(cand))
+                    break
+            diff = vb - va
+            if stored is not None:
+                delta_str = f"{stored:+.1f}%"
+                delta_label = "Change"
+                pct_abs = abs(stored)
+            else:
+                pct = (diff / va * 100.0) if va else 0.0
+                sign = "+" if diff > 0 else ("-" if diff < 0 else "")
+                delta_str = f"{sign}{_fmt_inr(abs(diff))}"
+                delta_label = f"{pct:+.1f}% change"
+                pct_abs = abs(pct)
+            sign = "+" if diff > 0 else ("-" if diff < 0 else "")
+            return {
+                "kind": "diff",
+                "title": _clean_question_title(question, "Comparison"),
+                "intro": "Side-by-side comparison",
+                "icon": "��",
+                "value": "",
+                "value_label": "",
+                "date_from": "",
+                "date_to": "",
+                "tiles": [
+                    {"icon": "units", "value": _fmt_inr(va), "label": label_a},
+                    {"icon": "orders", "value": _fmt_inr(vb), "label": label_b},
+                    {"icon": "skus", "value": delta_str, "label": delta_label},
+                ],
+                "biggest": {"label": "Higher", "name": (label_b if diff > 0 else (label_a if diff < 0 else "Equal")),
+                            "share": pct_abs},
+                "leaders": [],
+                "tiers": [],
+                "standouts": [],
+                "actions": [],
+                "explore": [
+                    "Show both sides distributor-wise",
+                    "Show both sides item-wise",
+                    "Show the month-wise trend across both sides",
+                    "Which items drove the biggest change?",
+                    "Compare the quantities instead of values",
+                ],
+                "avg_bits": [],
+                "footnote": "Both values are computed from your own territory data.",
+            }
+
+    # ── Case B: two-entity comparison (e.g. distributor-compare) ────────────
+    name_col = next((c for c in ("ds_name", "dealer_name", "item_name", "itemdescription", "ledgername")
+                     if c in cols), None)
+    val_col = next((c for c in ("total", "total_billed_value", "total_primary_sales", "total_sales")
+                    if c in cols), None)
+    if name_col and val_col and len(rows) == 2:
+        r1, r2 = rows[0], rows[1]
+        n1, n2 = str(r1.get(name_col) or "Side A"), str(r2.get(name_col) or "Side B")
+        v1, v2 = _safe_float(r1.get(val_col)), _safe_float(r2.get(val_col))
+        diff = v2 - v1
+        pct = (diff / v1 * 100.0) if v1 else 0.0
+        sign = "+" if diff > 0 else ("-" if diff < 0 else "")
+        return {
+            "kind": "diff",
+            "title": _clean_question_title(question, "Comparison"),
+            "intro": "Head-to-head comparison",
+            "icon": "⚖️",
+            "value": "",
+            "value_label": "",
+            "date_from": "",
+            "date_to": "",
+            "tiles": [
+                {"icon": "units", "value": _fmt_inr(v1), "label": n1[:40]},
+                {"icon": "orders", "value": _fmt_inr(v2), "label": n2[:40]},
+                {"icon": "skus", "value": f"{sign}{_fmt_inr(abs(diff))}", "label": f"{pct:+.1f}% change"},
+            ],
+            "biggest": {"label": "Higher", "name": (n2 if diff > 0 else (n1 if diff < 0 else "Equal")),
+                        "share": round(abs(pct), 1)},
+            "leaders": [],
+            "tiers": [],
+            "standouts": [],
+            "actions": [],
+            "explore": [
+                "Show both sides item-wise",
+                "Show both sides dealer-wise",
+                "Which items drove the difference?",
+                "Compare them month-wise",
+                "Compare the quantities instead of values",
+            ],
+            "avg_bits": [],
+            "footnote": "Values computed from your own territory data.",
+        }
+
+    return {}
+
+
+def build_phase1_briefing(
+    question: str,
+    descriptions: Optional[List[Tuple[str, str]]],
+    executed_data: List[Dict[str, Any]],
+    first_flag: Optional[str] = None,
+    shape: str = "analytical",
+) -> Dict[str, Any]:
+    """
+    Structured branded report-card payload (tiles, leaders, tiers, standouts,
+    actions, explore). Deterministic, zero LLM tokens. Used by BOTH the ON path
+    (built in Phase 2) and the OFF path (built inline).
+
+    `shape` (response-shape engine) selects the card variant, SFA-style à-la-carte:
+      - comparison → purpose-built diff card (side-by-side tiles + delta + winner)
+      - ranking    → tiles + leaders + explore (no tiers/standouts/actions)
+      - trend      → time-series card (auto-detected) or compact tiles + explore
+      - lookup     → single headline tile + explore
+      - general    → {} (no data involved)
+    Failed builds fall back to the reduced full card (safe default).
+    """
+    shape = (shape or "analytical").strip().lower() or "analytical"
+    if shape == "general":
+        return {}
+    if shape == "comparison":
+        # À-la-carte: comparisons get their own purpose-built diff card
+        # (side-by-side tiles + delta), NOT a trimmed full card. If the data
+        # doesn't fit a diff shape, fall through to the reduced full card.
+        try:
+            diff_card = _build_dms_comparison_card(question, descriptions, executed_data)
+            if diff_card:
+                return diff_card
+        except Exception as _de:
+            print(f"[briefing] comparison card failed: {_de}")
+    try:
+        flag = first_flag or ((descriptions or [])[0][0] if descriptions else "")
+        rows, cols, kpis, metric_valid = _classify_and_fuse_datasets(executed_data, _module_of(flag))
+        if not rows:
+            return {}
+        mod_type = _detect_module_type(flag, question, cols)
+        time_col = _find_col(TIME_COL_CANDIDATES, {c.lower(): c for c in cols})
+        time_str = _extract_time_context(question, rows, time_col)
+        analytics = _compute_analytics(rows, cols, kpis, mod_type, time_str, metric_valid)
+        config = _MODULE_CONFIGS.get(mod_type, _MODULE_CONFIGS["generic"])
+    except Exception as _e:
+        print(f"[briefing] build failed: {_e}")
+        return {}
+
+    # Period breakdowns (monthly/daily) get a TREND report, never an entity leaderboard.
+    if _is_time_series(rows, cols):
+        _pts = _time_series_points(rows, cols)
+        if _pts:
+            return _build_phase1_trend_briefing(analytics, config, question, _pts)
+
+    icon = _MODULE_ICONS.get(mod_type, "��")
+    value_label = _MODULE_VALUE_LABELS.get(mod_type, f"Total {config.value_label}")
+
+    # Tiles
+    tiles: List[Dict[str, str]] = []
+    if analytics.total_qty > 0:
+        tiles.append({"icon": "units", "value": _fmt_num(analytics.total_qty), "label": "Units"})
+    if analytics.module in ("secondary_sales", "purchases", "primary_sales") and analytics.invoice_count > 0:
+        tiles.append({"icon": "orders", "value": f"{analytics.invoice_count:,}", "label": "Transactions"})
+    elif analytics.invoice_count > 1:
+        tiles.append({"icon": "orders", "value": f"{analytics.invoice_count:,}", "label": "Transactions"})
+    if analytics.entity_count > 1:
+        tiles.append({"icon": "skus", "value": f"{analytics.entity_count:,}", "label": f"Active {config.entity_noun_plural}"})
+    if analytics.unique_outlets > 0:
+        tiles.append({"icon": "outlets", "value": f"{analytics.unique_outlets:,}", "label": "Accounts"})
+
+    # Leaders
+    ents = analytics.ranked_entities
+    leaders: List[Dict[str, Any]] = []
+    if ents and analytics.total_val > 0:
+        for e in ents[:5]:
+            leaders.append({
+                "rank": e.get("rank") if e.get("rank") else (len(leaders) + 1),
+                "name": e.get("name") or f"{config.entity_noun} {len(leaders) + 1}",
+                "value": _fmt_inr(_safe_float(e.get("val"))),
+                "share": round(_safe_float(e.get("share")), 1),
+                "units": _fmt_num(_safe_float(e.get("qty"))),
+            })
+        remaining = ents[5:]
+        if remaining:
+            rem_val = sum(_safe_float(e.get("val")) for e in remaining)
+            leaders.append({
+                "rest": True,
+                "name": f"Next {len(remaining)} {config.entity_noun_plural.lower()}",
+                "value": _fmt_inr(rem_val),
+                "share": round(rem_val / analytics.total_val * 100, 1),
+                "units": _fmt_num(sum(_safe_float(e.get("qty")) for e in remaining)),
+            })
+
+    # Portfolio tiers
+    tiers: List[Dict[str, Any]] = []
+    if len(ents) >= 5:
+        tier_names = {"ANCHOR": "must-protect", "CORE": "steady earners", "TAIL": "small but active", "DORMANT": "barely moving"}
+        tier_bands = {"ANCHOR": "≥25% of value", "CORE": "5 to 25%", "TAIL": "1 to 5%", "DORMANT": "<1%"}
+        grouped: Dict[str, List[str]] = {"ANCHOR": [], "CORE": [], "TAIL": [], "DORMANT": []}
+        for e in ents:
+            grouped[analytics.advanced.entity_tiers.get(e.get("name", ""), "DORMANT")].append(e.get("name", ""))
+        for tier in ("ANCHOR", "CORE", "TAIL", "DORMANT"):
+            names = grouped[tier]
+            if names:
+                sample = ", ".join(names[:2])
+                suffix = f" and {len(names) - 2} more" if len(names) > 2 else ""
+                tiers.append({
+                    "tier": tier, "band": tier_bands[tier], "meaning": tier_names[tier],
+                    "count": len(names), "label": f"{sample}{suffix}",
+                })
+
+    # Standouts
+    standouts: List[Dict[str, str]] = []
+    top1_name = (ents[0].get("name") if ents else "") or ""
+    top1_share = _safe_float(ents[0].get("share")) if ents else 0.0
+    adv = analytics.advanced
+    if analytics.concentration_risk == "HIGH":
+        standouts.append({"icon": "pulse", "title": "High concentration",
+                          "text": f"Top 3 {config.entity_noun_plural.lower()} give {analytics.top_3_share:.1f}% of the total; {top1_name} alone sits at {top1_share:.1f}%."})
+    elif analytics.concentration_risk == "MODERATE":
+        standouts.append({"icon": "pulse", "title": "Moderate concentration",
+                          "text": f"Top 3 {config.entity_noun_plural.lower()} contribute {analytics.top_3_share:.1f}%. Watch the top few for stockout or churn."})
+    else:
+        standouts.append({"icon": "pulse", "title": "Well spread",
+                          "text": f"No single {config.entity_noun.lower()} dominates; top 3 only make {analytics.top_3_share:.1f}%."})
+    if adv.outlier_entities:
+        oe = adv.outlier_entities[0]
+        oz = _safe_float(oe.get("z_score", 0.0))
+        if oz > 0:
+            standouts.append({"icon": "trend", "title": f"Outperformer: {oe.get('name', 'Unknown')}",
+                              "text": f"{oz:+.1f}σ vs peers at {_fmt_inr(_safe_float(oe.get('val')))}. Worth protecting and studying."})
+        else:
+            standouts.append({"icon": "trend", "title": f"Underperformer: {oe.get('name', 'Unknown')}",
+                              "text": f"{oz:+.1f}σ vs peers at {_fmt_inr(_safe_float(oe.get('val')))}. Check pricing, stock or demand."})
+
+    # Actions
+    actions: List[Dict[str, str]] = []
+    if top1_name and top1_share > 0:
+        buffer_days = max(7, round(top1_share / 5))
+        actions.append({"icon": "shield", "title": f"Protect {top1_name}",
+                        "body": f"It drives {top1_share:.1f}% of the total — keep {buffer_days}-day cover on every cycle."})
+    if len(ents) > 1:
+        top2_name = ents[1].get("name", "")
+        top2_val = _safe_float(ents[1].get("val"))
+        if top2_name and top2_val > 0:
+            actions.append({"icon": "link", "title": "Bundle and lift",
+                            "body": f"Pair {top1_name} with {top2_name}; target {_fmt_inr(top2_val)} to {_fmt_inr(top2_val * 1.25)} (+25%)."})
+    if adv.gini_coefficient > 0.6:
+        tail_count = sum(1 for e in ents if adv.entity_tiers.get(e.get("name", ""), "DORMANT") in ("TAIL", "DORMANT"))
+        if tail_count:
+            actions.append({"icon": "spread", "title": "Spread the risk",
+                            "body": f"The mix is uneven (Gini {adv.gini_coefficient:.2f}). Activate {tail_count} low-share accounts with a targeted push."})
+
+    explore = [
+        "Compare #1 and #2",
+        f"How did {ents[1].get('name', 'the runner-up') if len(ents) > 1 else 'it'} perform?",
+        f"What if {ents[0].get('name', 'the top account')} grew 20%?" if ents else "Run a growth scenario",
+        "Show me the CORE tier only",
+        "Why is concentration high?",
+    ]
+
+    avg_bits: List[str] = []
+    if analytics.entity_count > 1 and analytics.avg_ticket > 0:
+        avg_bits.append(f"Avg. per {config.entity_noun.lower()}: {_fmt_inr(analytics.avg_ticket)}")
+    if analytics.total_qty > 0 and analytics.avg_realization > 0:
+        avg_bits.append(f"Avg. per unit: {_fmt_inr(analytics.avg_realization)}")
+
+    date_from, date_to = _date_range_from_rows(rows)
+    biggest_label = f"Biggest {config.entity_noun.lower()}"
+
+    payload = {
+        "title": _clean_question_title(question, config.domain_label),
+        "intro": f"{config.domain_label} overview",
+        "icon": icon,
+        "value": _fmt_inr(analytics.total_val) if analytics.total_val > 0 else "",
+        "value_label": value_label,
+        "date_from": date_from,
+        "date_to": date_to,
+        "tiles": tiles[:4],
+        "biggest": {"label": biggest_label, "name": (top1_name if analytics.total_val > 0 else ""),
+                    "share": round(top1_share, 1)},
+        "leaders": leaders[:6],
+        "tiers": tiers,
+        "standouts": standouts[:3],
+        "actions": actions[:3],
+        "explore": explore,
+        "avg_bits": avg_bits,
+        "footnote": f"All values are computed from your own territory data for {analytics.time_str}.",
+    }
+
+    if shape in ("ranking", "trend", "lookup", "comparison"):
+        # Narrow shapes: keep headline tiles + explore chips, drop deep-dive blocks.
+        # Ranking keeps its leaders; comparison keeps leaders too (the narrative
+        # carries the side-by-side markdown table); trend/lookup drop them.
+        if shape in ("trend", "lookup"):
+            payload["leaders"] = []
+        payload["tiles"] = (payload.get("tiles") or [])[:1] if shape == "lookup" else (payload.get("tiles") or [])[:2]
+        if not payload["tiles"] and analytics.total_val > 0:
+            # Aggregate-only datasets have no natural tiles — synthesise one
+            # headline tile from the computed total so the card still renders.
+            payload["tiles"] = [{"icon": "units", "value": _fmt_inr(analytics.total_val), "label": "Total"}]
+        payload["tiers"] = []
+        payload["standouts"] = []
+        payload["actions"] = []
+
+    return payload
+
+
+def _build_read(analytics: ComputedAnalytics, config: ModuleConfig) -> str:
+    """
+    Concise, plain-language synthesis for the report card's analysis panel.
+    The card already shows KPIs/leaders/mix/standouts/actions, so this only adds
+    interpretation (the "so what") and never repeats those sections.
+    """
+    ents = analytics.ranked_entities
+    top1 = ents[0] if ents else {}
+    top1_name = top1.get("name", "")
+    top1_share = _safe_float(top1.get("share"))
+    adv = analytics.advanced
+    total_val = analytics.total_val
+    noun = config.entity_noun.lower()
+    noun_plural = config.entity_noun_plural.lower()
+
+    parts: List[str] = []
+    if total_val > 0:
+        opening = f"Your **{config.domain_label.lower()}** for **{analytics.time_str}** comes to **{_fmt_inr(total_val)}**"
+        if analytics.total_qty > 0:
+            opening += f" across **{_fmt_num(analytics.total_qty)} units**"
+        if analytics.entity_count > 1:
+            opening += f" from **{analytics.entity_count} {noun_plural}**"
+        opening += "."
+    else:
+        opening = f"Here is the picture for your **{config.domain_label.lower()}** in **{analytics.time_str}**."
+    parts.append(opening)
+
+    if top1_name and top1_share > 0:
+        if analytics.concentration_risk == "HIGH":
+            parts.append(
+                f"**{top1_name}** leads with **{top1_share:.1f}%**, and the top 3 together make "
+                f"**{analytics.top_3_share:.1f}%** of the total — a concentrated picture, so a stockout or "
+                f"churn on the leaders would be felt immediately."
+            )
+        elif analytics.concentration_risk == "MODERATE":
+            parts.append(
+                f"**{top1_name}** leads with **{top1_share:.1f}%**, while the top 3 contribute "
+                f"**{analytics.top_3_share:.1f}%**, a reasonably balanced spread."
+            )
+        else:
+            parts.append(
+                f"**{top1_name}** leads with **{top1_share:.1f}%**, but no single {noun} dominates "
+                f"(top 3 = **{analytics.top_3_share:.1f}%**), so activity is well spread."
+            )
+
+    if adv.outlier_entities:
+        oe = adv.outlier_entities[0]
+        nm = oe.get("name", "") or "One entry"
+        z = _safe_float(oe.get("z_score", 0.0))
+        if z > 0:
+            parts.append(f"**{nm}** is running well ahead of its peers — the clearest story to lean into.")
+        else:
+            parts.append(f"**{nm}** is trailing its peers — the first place to check pricing, stock and demand.")
+
+    if adv.gini_coefficient > 0.6 and len(ents) > 5:
+        parts.append("The mix is uneven, so widening the active base would reduce risk.")
+    elif analytics.avg_ticket > 0:
+        parts.append(f"Average value per {noun} is **{_fmt_inr(analytics.avg_ticket)}**.")
+
+    return "\n\n".join(parts)
+
+
+def generate_bi_analysis(
+    question: str,
+    merged_exec: Dict[str, Any],
+    staff_context: Optional[Dict[str, Any]] = None,
+    first_flag: Optional[str] = None,
+    descriptions: Optional[List[Tuple[str, str]]] = None,
+    output_lang: str = "auto",
+    executed_data: Optional[List[Dict[str, Any]]] = None,
+    conversation_id: Optional[str] = None,
+    staff_uid: Optional[str] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Concise narrative for the Direct-BI report card's analysis panel.
+    Deterministic, 0 LLM tokens, and deliberately non-duplicative.
+    """
+    greeting_answer = handle_general_or_greeting(question, staff_context=staff_context)
+    if greeting_answer:
+        return _clean_markdown_formatting(greeting_answer)
+    if staff_uid and conversation_id:
+        cq_answer = resolve_cross_questioning(staff_uid, conversation_id, question)
+        if cq_answer:
+            return _clean_markdown_formatting(cq_answer)
+
+    flag = first_flag or ((descriptions or [])[0][0] if descriptions else "")
+    datasets_to_fuse = executed_data if executed_data else [merged_exec]
+    rows, cols, kpis, metric_valid = _classify_and_fuse_datasets(datasets_to_fuse, _module_of(flag))
+
+    if not rows and merged_exec:
+        rows = [r for r in (merged_exec.get("rows") or []) if isinstance(r, dict)]
+        cols = [c for c in (merged_exec.get("columns") or []) if c and not c.startswith("_")]
+
+    if not rows:
+        clean_q = _clean_question_title(question, "Commercial Inquiry")
+        time_str = _extract_time_context(question, [], None)
+        return _clean_markdown_formatting(
+            f"**{clean_q}**\n\n"
+            f"No activity was recorded in your area for **{time_str}**. "
+            f"Try a wider date window, or confirm with your team that this is expected."
+        )
+
+    cols_map = {c.lower(): c for c in cols}
+    time_col = _find_col(TIME_COL_CANDIDATES, cols_map)
+    time_str = _extract_time_context(question, rows, time_col)
+    mod_type = _detect_module_type(flag, question, cols)
+    analytics = _compute_analytics(rows, cols, kpis, mod_type, time_str, metric_valid)
+
+    if staff_uid and conversation_id:
+        _push_turn_to_memory(staff_uid, conversation_id, analytics, question)
+
+    config = _MODULE_CONFIGS.get(mod_type, _MODULE_CONFIGS["generic"])
+    # Period breakdowns get a trend narrative, not an entity leaderboard.
+    if _is_time_series(rows, cols):
+        _pts = _time_series_points(rows, cols)
+        if _pts:
+            return _clean_markdown_formatting(_build_read_trend(analytics, config, _pts))
+
+    return _clean_markdown_formatting(_build_read(analytics, config))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1822,6 +2626,23 @@ def build_deterministic_chart_spec(
         return {}
 
     cols_map = {c.lower(): c for c in cols}
+
+    def _is_num(v: Any) -> bool:
+        if v is None or isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float, decimal.Decimal)):
+            return True
+        try:
+            float(str(v).replace(",", ""))
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    numeric_cols = [c for c in cols if any(_is_num(r.get(c)) for r in rows)]
+    categorical_cols = [c for c in cols if c not in numeric_cols]
+    x_opts = categorical_cols or cols
+    y_opts = numeric_cols or cols
+
     val_col = _find_col(VAL_COL_CANDIDATES, cols_map)
     time_col = _find_col(TIME_COL_CANDIDATES, cols_map)
     name_col = _find_col(ENTITY_NAME_CANDIDATES, cols_map)
@@ -1832,6 +2653,10 @@ def build_deterministic_chart_spec(
             "chart_type": "line",
             "x": time_col,
             "y": val_col,
+            "suggested_x": time_col,
+            "suggested_y": val_col,
+            "suggested_x_options": x_opts,
+            "suggested_y_options": y_opts,
             "rows": rows,
         }
 
@@ -1843,6 +2668,10 @@ def build_deterministic_chart_spec(
                 "chart_type": "pie",
                 "x": name_col,
                 "y": val_col,
+                "suggested_x": name_col,
+                "suggested_y": val_col,
+                "suggested_x_options": x_opts,
+                "suggested_y_options": y_opts,
                 "rows": rows,
             }
 
@@ -1852,6 +2681,10 @@ def build_deterministic_chart_spec(
             "chart_type": "bar",
             "x": name_col,
             "y": val_col,
+            "suggested_x": name_col,
+            "suggested_y": val_col,
+            "suggested_x_options": x_opts,
+            "suggested_y_options": y_opts,
             "rows": rows,
         }
 
@@ -1875,6 +2708,10 @@ def build_deterministic_chart_spec(
             "chart_type": "bar",
             "x": label_col,
             "y": numeric_col,
+            "suggested_x": label_col,
+            "suggested_y": numeric_col,
+            "suggested_x_options": x_opts,
+            "suggested_y_options": y_opts,
             "rows": rows,
         }
 

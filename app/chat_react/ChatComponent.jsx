@@ -124,12 +124,7 @@ function renderMarkdown(text, flag, flagDescription) {
 
   if (!html.startsWith('<')) html = `<p>${html}</p>`;
   
-  let flagBadge = '';
-  if (flag) {
-    flagBadge = `<div class="dms-flags">🔍 Active Scope: <code>${flag}</code>${flagDescription ? ` &bull; <em>${flagDescription}</em>` : ''}</div>`;
-  }
-  
-  return '<div class="dms-ai-text">' + html + '</div>' + flagBadge;
+  return '<div class="dms-ai-text">' + html + '</div>';
 }
 
 /* ═══════════════════════════════════════════════════════════════════

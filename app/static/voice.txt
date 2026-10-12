@@ -1,0 +1,735 @@
+================================================================================
+COMPLETE GOOGLE SPEECH-TO-TEXT (STT) & MULTI-LANGUAGE VOICE SYSTEM DOCUMENTATION
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. SYSTEM ARCHITECTURE & 3-LANGUAGE MODEL
+2. END-TO-END WORKFLOW & USER EXPERIENCE
+3. API SPECIFICATION & SCHEMAS
+4. BACKEND IMPLEMENTATION (PYTHON / FASTAPI)
+   - app/services/user_prefs.py
+   - app/routes/speech.py
+5. FRONTEND IMPLEMENTATION (HTML / CSS / JAVASCRIPT)
+   - HTML Layout & Modal Component (index.html)
+   - CSS Styling (.lpm-overlay, .lpm-card, chips)
+   - JS Recording, Resampling, Audio Processing & Handlers (app.js)
+
+
+================================================================================
+1. SYSTEM ARCHITECTURE & 3-LANGUAGE MODEL
+================================================================================
+- Google Speech-to-Text v1 API limits transcription requests to:
+  1 Primary Language + Maximum 3 Alternative Languages.
+- Model Design:
+  1. English (India) [en-IN] : Fixed Primary Language (Always Active)
+  2. Hindi           [hi-IN] : Fixed Secondary Language (Always Active)
+  3. Regional Choice [xx-IN] : Per-User Tertiary Language (Selected by User)
+     Allowed Regional Languages:
+     - Tamil (ta-IN), Telugu (te-IN), Kannada (kn-IN), Malayalam (ml-IN),
+       Marathi (mr-IN), Gujarati (gu-IN), Punjabi (pa-IN), Bengali (bn-IN), Urdu (ur-IN).
+
+- Audio Pipeline & Quality Optimizations:
+  1. Web Audio API captures PCM audio from microphone.
+  2. Client-side linear interpolation resamples audio from browser sample rate (e.g. 48kHz) to 16kHz.
+  3. Formatted into 16-bit Mono WAV format and Base64-encoded.
+  4. Backend automatically parses WAV header, normalizes low volume (amplifies up to 30x), trims leading/trailing silence (VAD), and applies a noise gate to suppress background hiss before calling Google STT API.
+
+
+================================================================================
+2. END-TO-END WORKFLOW & USER EXPERIENCE
+================================================================================
+1. Staff Selection: User selects a Staff Member UID from dropdown or host integration auto-loads UID.
+2. Preference Check: Frontend queries `GET /api/speech/lang-pref?uid={staffUid}` (and checks local storage cache).
+3. First-Time Microphone Click:
+   - If the user HAS NOT set a regional language preference yet, a setup modal pops up.
+   - The user selects their regional language chip (e.g. Tamil / Telugu / Marathi) and clicks "Save & Start Recording".
+   - The selection is persisted to server backend (`user_prefs.json`) and saved to `localStorage`.
+   - The modal auto-closes and microphone recording starts immediately.
+4. Subsequent Microphone Clicks:
+   - The system recognizes the user's preference and starts recording immediately without showing any modal.
+   - Speech audio is sent to `/api/speech/transcribe` with the user's UID.
+   - Google Cloud Speech API checks for speech across English + Hindi + User's 3rd Regional choice simultaneously and returns the transcript.
+
+
+================================================================================
+3. API SPECIFICATION & SCHEMAS
+================================================================================
+
+A. GET /api/speech/lang-pref
+----------------------------
+Query Parameter: ?uid={staffUid}  (or Header: X-Uid)
+Response JSON:
+{
+  "uid": "staff_101",
+  "third_lang": "ta-IN",
+  "fixed_primary": "en-IN",
+  "fixed_alt": "hi-IN",
+  "available_langs": [
+    { "code": "bn-IN", "label": "Bengali" },
+    { "code": "gu-IN", "label": "Gujarati" },
+    { "code": "kn-IN", "label": "Kannada" },
+    { "code": "ml-IN", "label": "Malayalam" },
+    { "code": "mr-IN", "label": "Marathi" },
+    { "code": "pa-IN", "label": "Punjabi" },
+    { "code": "ta-IN", "label": "Tamil" },
+    { "code": "te-IN", "label": "Telugu" },
+    { "code": "ur-IN", "label": "Urdu" }
+  ]
+}
+
+B. POST /api/speech/lang-pref
+-----------------------------
+Request Body JSON:
+{
+  "uid": "staff_101",
+  "third_lang": "ta-IN"
+}
+Response JSON:
+{
+  "ok": true,
+  "uid": "staff_101",
+  "third_lang": "ta-IN",
+  "fixed_primary": "en-IN",
+  "fixed_alt": "hi-IN"
+}
+
+C. POST /api/speech/transcribe
+------------------------------
+Request Body JSON:
+{
+  "audio_b64": "<base64_encoded_16kHz_wav_bytes>",
+  "sample_rate_hz": 16000,
+  "uid": "staff_101"
+}
+Response JSON:
+{
+  "ok": true,
+  "transcript": "Secondary orders for today",
+  "confidence": 0.96,
+  "model": "latest_short",
+  "language": "en-IN",
+  "requested_language": "en-IN"
+}
+
+
+================================================================================
+4. BACKEND IMPLEMENTATION (PYTHON / FASTAPI)
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: app/services/user_prefs.py
+--------------------------------------------------------------------------------
+import json
+import os
+import threading
+from pathlib import Path
+from typing import Any, Dict
+
+VALID_THIRD_LANGS: set[str] = {
+    "ta-IN", "te-IN", "kn-IN", "ml-IN", "mr-IN",
+    "gu-IN", "pa-IN", "bn-IN", "ur-IN",
+}
+
+DEFAULT_THIRD_LANG = "ta-IN"
+_LOCK = threading.Lock()
+
+def _prefs_path() -> Path:
+    try:
+        from ..config.settings import settings
+        return Path(settings.BASE_DIR) / "user_prefs.json"
+    except Exception:
+        return Path(__file__).parent.parent / "user_prefs.json"
+
+def _load_all() -> Dict[str, Any]:
+    path = _prefs_path()
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _save_all(data: Dict[str, Any]) -> None:
+    path = _prefs_path()
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[USER_PREFS] Save failed: {e}")
+
+class UserPrefsService:
+    @staticmethod
+    def get_voice_lang(uid: str) -> str:
+        if not uid:
+            return DEFAULT_THIRD_LANG
+        with _LOCK:
+            data = _load_all()
+        return data.get(uid, {}).get("voice_third_lang", DEFAULT_THIRD_LANG)
+
+    @staticmethod
+    def set_voice_lang(uid: str, lang: str) -> str:
+        if not uid:
+            return DEFAULT_THIRD_LANG
+        if lang not in VALID_THIRD_LANGS:
+            lang = DEFAULT_THIRD_LANG
+        with _LOCK:
+            data = _load_all()
+            if uid not in data:
+                data[uid] = {}
+            data[uid]["voice_third_lang"] = lang
+            _save_all(data)
+        return lang
+
+    @staticmethod
+    def valid_third_langs() -> list[dict]:
+        mapping = {
+            "ta-IN": "Tamil", "te-IN": "Telugu", "kn-IN": "Kannada",
+            "ml-IN": "Malayalam", "mr-IN": "Marathi", "gu-IN": "Gujarati",
+            "pa-IN": "Punjabi", "bn-IN": "Bengali", "ur-IN": "Urdu"
+        }
+        return [{"code": k, "label": v} for k, v in sorted(mapping.items(), key=lambda x: x[1])]
+
+
+--------------------------------------------------------------------------------
+FILE: app/routes/speech.py
+--------------------------------------------------------------------------------
+import base64
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Header, HTTPException, Request
+
+from ..config.settings import settings
+from ..services.user_prefs import UserPrefsService, VALID_THIRD_LANGS, DEFAULT_THIRD_LANG
+
+router = APIRouter(prefix="/api", tags=["speech"])
+
+FIXED_PRIMARY = "en-IN"
+FIXED_ALT     = "hi-IN"
+
+def _build_lang_config(third_lang: str) -> Dict:
+    alt_langs = [FIXED_ALT]
+    if third_lang and third_lang not in (FIXED_PRIMARY, FIXED_ALT):
+        alt_langs.append(third_lang)
+    return {
+        "primary": FIXED_PRIMARY,
+        "alt_langs": alt_langs,
+        "model": "latest_short",
+        "use_enhanced": True,
+    }
+
+@router.get("/speech/lang-pref")
+async def get_lang_pref(uid: Optional[str] = None, x_uid: Optional[str] = Header(None)) -> Dict[str, Any]:
+    resolved_uid = (uid or x_uid or "").strip()
+    third_lang = UserPrefsService.get_voice_lang(resolved_uid)
+    return {
+        "uid": resolved_uid,
+        "third_lang": third_lang,
+        "fixed_primary": FIXED_PRIMARY,
+        "fixed_alt": FIXED_ALT,
+        "available_langs": UserPrefsService.valid_third_langs(),
+    }
+
+@router.post("/speech/lang-pref")
+async def set_lang_pref(req: Request, x_uid: Optional[str] = Header(None)) -> Dict[str, Any]:
+    payload = await req.json()
+    uid = (payload.get("uid") or x_uid or "").strip()
+    third_lang = (payload.get("third_lang") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid is required")
+    if third_lang not in VALID_THIRD_LANGS:
+        raise HTTPException(status_code=422, detail="Invalid third_lang")
+    saved = UserPrefsService.set_voice_lang(uid, third_lang)
+    return {"ok": True, "uid": uid, "third_lang": saved, "fixed_primary": FIXED_PRIMARY, "fixed_alt": FIXED_ALT}
+
+@router.post("/speech/transcribe")
+async def transcribe(req: Request, x_uid: Optional[str] = Header(None)) -> Dict[str, Any]:
+    payload = await req.json()
+    audio_b64 = (payload.get("audio_b64") or "").strip()
+    if not audio_b64:
+        raise HTTPException(status_code=400, detail="audio_b64 is required")
+    try:
+        sample_rate_hz = int(payload.get("sample_rate_hz") or 16000)
+    except Exception:
+        sample_rate_hz = 16000
+
+    uid = (payload.get("uid") or x_uid or "").strip()
+    third_lang = UserPrefsService.get_voice_lang(uid) if uid else DEFAULT_THIRD_LANG
+    lang_cfg = _build_lang_config(third_lang)
+
+    try:
+        audio_bytes = base64.b64decode(audio_b64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64")
+
+    return _transcribe_google_cloud(audio_bytes, sample_rate_hz, lang_cfg)
+
+
+def _transcribe_google_cloud(audio_bytes: bytes, sample_rate_hz: int, lang_cfg: Dict) -> Dict[str, Any]:
+    from google.cloud import speech_v1
+    from google.oauth2 import service_account
+
+    creds_dict = settings.GOOGLE_CLOUD_CREDENTIALS_DICT
+    credentials = service_account.Credentials.from_service_account_info(creds_dict)
+    client = speech_v1.SpeechClient(credentials=credentials)
+
+    primary_lang = lang_cfg["primary"]
+    alt_langs    = lang_cfg["alt_langs"]
+    model        = lang_cfg.get("model", "latest_short")
+    use_enhanced = lang_cfg.get("use_enhanced", True)
+
+    if audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
+        wav_info = _read_wav_format(audio_bytes)
+        sample_rate_hz = wav_info["sample_rate"]
+        audio_data = _extract_wav_audio(audio_bytes)
+        if wav_info["channels"] == 2:
+            audio_data = _stereo_to_mono(audio_data)
+    else:
+        audio_data = audio_bytes
+
+    audio_data = _normalize_audio(audio_data)
+    audio_data = _trim_silence(audio_data, sample_rate_hz)
+    audio_data = _noise_gate(audio_data, threshold=200)
+
+    audio_obj = speech_v1.RecognitionAudio(content=audio_data)
+    attempts = [
+        (model, use_enhanced, speech_v1.RecognitionConfig.AudioEncoding.LINEAR16),
+        ("default", True, speech_v1.RecognitionConfig.AudioEncoding.LINEAR16),
+        ("default", False, speech_v1.RecognitionConfig.AudioEncoding.LINEAR16),
+    ]
+
+    for attempt_model, attempt_enhanced, encoding in attempts:
+        config = speech_v1.RecognitionConfig(
+            encoding=encoding,
+            sample_rate_hertz=sample_rate_hz,
+            language_code=primary_lang,
+            alternative_language_codes=alt_langs,
+            enable_automatic_punctuation=True,
+            model=attempt_model,
+            use_enhanced=attempt_enhanced,
+            max_alternatives=3,
+        )
+        try:
+            response = client.recognize(config=config, audio=audio_obj)
+        except Exception:
+            continue
+
+        transcript = ""
+        confidence_scores = []
+        for result in response.results:
+            if result.alternatives:
+                best = result.alternatives[0]
+                if best.transcript.strip():
+                    transcript += best.transcript + " "
+                    confidence_scores.append(best.confidence)
+
+        transcript = transcript.strip()
+        if response.results:
+            avg_conf = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+            detected_lang = response.results[0].language_code or primary_lang
+            return {
+                "ok": True,
+                "transcript": transcript,
+                "confidence": avg_conf,
+                "model": attempt_model,
+                "language": detected_lang,
+                "requested_language": primary_lang,
+            }
+
+    return {"ok": True, "transcript": "", "confidence": 0.0, "warning": "No speech detected"}
+
+def _read_wav_format(wav_bytes: bytes) -> dict:
+    import struct
+    try:
+        pos = 12
+        while pos < len(wav_bytes) - 8:
+            chunk_id = wav_bytes[pos:pos + 4]
+            chunk_size = struct.unpack("<I", wav_bytes[pos + 4:pos + 8])[0]
+            if chunk_id == b"fmt ":
+                fmt = pos + 8
+                channels = struct.unpack("<H", wav_bytes[fmt + 2:fmt + 4])[0]
+                sample_rate = struct.unpack("<I", wav_bytes[fmt + 4:fmt + 8])[0]
+                bits_per_sample = struct.unpack("<H", wav_bytes[fmt + 14:fmt + 16])[0]
+                return {"channels": channels, "sample_rate": sample_rate, "bits_per_sample": bits_per_sample}
+            pos += 8 + chunk_size
+    except Exception:
+        pass
+    return {"channels": 1, "sample_rate": 16000, "bits_per_sample": 16}
+
+def _extract_wav_audio(wav_bytes: bytes) -> bytes:
+    import struct
+    try:
+        pos = 12
+        while pos < len(wav_bytes) - 8:
+            chunk_id = wav_bytes[pos:pos + 4]
+            chunk_size = struct.unpack("<I", wav_bytes[pos + 4:pos + 8])[0]
+            if chunk_id == b"data":
+                return wav_bytes[pos + 8: pos + 8 + chunk_size]
+            pos += 8 + chunk_size
+    except Exception:
+        pass
+    return wav_bytes
+
+def _stereo_to_mono(audio_bytes: bytes) -> bytes:
+    import struct
+    mono = bytearray()
+    for i in range(0, len(audio_bytes) - 3, 4):
+        left = struct.unpack("<h", audio_bytes[i:i + 2])[0]
+        right = struct.unpack("<h", audio_bytes[i + 2:i + 4])[0]
+        sample = int((left + right) / 2)
+        sample = max(-32768, min(32767, sample))
+        mono.extend(struct.pack("<h", sample))
+    return bytes(mono)
+
+def _normalize_audio(audio_data: bytes) -> bytes:
+    import struct
+    if len(audio_data) < 4: return audio_data
+    sample_window = min(len(audio_data), 4000)
+    samples = [abs(struct.unpack("<h", audio_data[i:i + 2])[0]) for i in range(0, sample_window - 1, 2)]
+    if not samples: return audio_data
+    max_val = max(samples)
+    if max_val < 1000 and max_val >= 100:
+        factor = min(8000 / max(max_val, 1), 30.0)
+        return _amplify_audio(audio_data, factor)
+    return audio_data
+
+def _amplify_audio(audio_bytes: bytes, factor: float) -> bytes:
+    import struct
+    amplified = bytearray()
+    for i in range(0, len(audio_bytes) - 1, 2):
+        sample = struct.unpack("<h", audio_bytes[i:i + 2])[0]
+        s = max(-32768, min(32767, int(sample * factor)))
+        amplified.extend(struct.pack("<h", s))
+    return bytes(amplified)
+
+def _trim_silence(audio_bytes: bytes, sample_rate_hz: int) -> bytes:
+    import struct
+    if len(audio_bytes) < 4: return audio_bytes
+    frame_size = max(4, int(0.03 * sample_rate_hz) * 2)
+    num_frames = max(1, len(audio_bytes) // frame_size)
+    is_speech = [False] * num_frames
+    for f in range(num_frames):
+        start, end = f * frame_size, min((f + 1) * frame_size, len(audio_bytes))
+        count = (end - start) // 2
+        if count > 0:
+            avg = sum(abs(struct.unpack("<h", audio_bytes[k:k + 2])[0]) for k in range(start, end - 1, 2)) / count
+            is_speech[f] = avg >= 120
+    try:
+        first_speech = is_speech.index(True)
+        last_speech = len(is_speech) - 1 - is_speech[::-1].index(True)
+    except ValueError:
+        return audio_bytes
+    return audio_bytes[max(0, first_speech - 2) * frame_size: min(len(is_speech), last_speech + 3) * frame_size]
+
+def _noise_gate(audio_bytes: bytes, threshold: int = 200) -> bytes:
+    import struct
+    if len(audio_bytes) < 4: return audio_bytes
+    cleaned = bytearray()
+    for i in range(0, len(audio_bytes) - 1, 2):
+        sample = struct.unpack("<h", audio_bytes[i:i + 2])[0]
+        cleaned.extend(b"\x00\x00" if abs(sample) < threshold else struct.pack("<h", sample))
+    return bytes(cleaned)
+
+
+================================================================================
+5. FRONTEND IMPLEMENTATION (HTML / CSS / JAVASCRIPT)
+================================================================================
+
+--------------------------------------------------------------------------------
+A. HTML LAYOUT & MODAL COMPONENT (analytics/static/index.html)
+--------------------------------------------------------------------------------
+<!-- Language Preference Setup Modal -->
+<div class="lpm-overlay" id="langPrefModal">
+  <div class="lpm-card">
+    <div class="lpm-head">
+      <div class="lpm-head-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3zm7 9a7 7 0 01-14 0m7 7v4m-4 0h8"/></svg>
+      </div>
+      <div>
+        <div class="lpm-title">Set Your Voice Language</div>
+        <div class="lpm-sub">One-time preference &mdash; saved to your profile</div>
+      </div>
+    </div>
+    <div class="lpm-body">
+      <div class="lpm-info">
+        <strong>English (IN)</strong> + <strong>Hindi</strong> are always active.<br>
+        Choose your <strong>3rd regional language</strong> &mdash; we'll listen for all 3 simultaneously.
+      </div>
+      <div class="lpm-label">Your 3rd Language</div>
+      <div class="lpm-grid" id="langPrefGrid">
+        <button class="lpm-chip selected" data-lang="ta-IN">Tamil</button>
+        <button class="lpm-chip" data-lang="te-IN">Telugu</button>
+        <button class="lpm-chip" data-lang="kn-IN">Kannada</button>
+        <button class="lpm-chip" data-lang="ml-IN">Malayalam</button>
+        <button class="lpm-chip" data-lang="mr-IN">Marathi</button>
+        <button class="lpm-chip" data-lang="gu-IN">Gujarati</button>
+        <button class="lpm-chip" data-lang="pa-IN">Punjabi</button>
+        <button class="lpm-chip" data-lang="bn-IN">Bengali</button>
+        <button class="lpm-chip" data-lang="ur-IN">Urdu</button>
+      </div>
+    </div>
+    <div class="lpm-foot">
+      <button class="lpm-save-btn" id="langPrefSaveBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3zm7 9a7 7 0 01-14 0m7 7v4m-4 0h8"/></svg>
+        Save &amp; Start Recording
+      </button>
+    </div>
+  </div>
+</div>
+
+
+--------------------------------------------------------------------------------
+B. CSS STYLING (analytics/static/index.html)
+--------------------------------------------------------------------------------
+<style>
+.lpm-overlay { display:none; position:fixed; inset:0; background:rgba(15,23,42,.6); backdrop-filter:blur(5px); z-index:3000; align-items:center; justify-content:center; padding:16px; }
+.lpm-overlay.show { display:flex; }
+.lpm-card { background:#fff; border-radius:20px; width:100%; max-width:400px; overflow:hidden; box-shadow:0 24px 64px rgba(15,23,42,.22); animation:lpmIn .22s cubic-bezier(.4,0,.2,1); }
+@keyframes lpmIn { from{opacity:0;transform:translateY(20px) scale(.96)} to{opacity:1;transform:translateY(0) scale(1)} }
+.lpm-head { display:flex; align-items:center; gap:14px; padding:18px 22px; background:linear-gradient(135deg,#1e3a8a,#2563eb); }
+.lpm-head-icon { width:40px; height:40px; border-radius:10px; background:rgba(255,255,255,.2); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+.lpm-title { font-size:15px; font-weight:700; color:#fff; }
+.lpm-sub { font-size:11px; color:rgba(255,255,255,.7); margin-top:2px; }
+.lpm-body { padding:18px 22px 14px; display:flex; flex-direction:column; gap:12px; }
+.lpm-info { background:#f0f5ff; border:1px solid rgba(37,99,235,.15); border-radius:10px; padding:11px 14px; font-size:12.5px; color:#1e3a8a; line-height:1.7; }
+.lpm-label { font-size:12px; font-weight:600; color:#475569; }
+.lpm-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+.lpm-chip { background:#f8faff; border:1.5px solid #e2e8f0; border-radius:10px; padding:10px 6px; font-size:13px; font-weight:600; color:#334155; cursor:pointer; transition:all .15s; text-align:center; font-family:'Inter',sans-serif; }
+.lpm-chip:hover { border-color:#2563eb; background:#eff6ff; color:#1e40af; transform:translateY(-1px); }
+.lpm-chip.selected { border-color:#2563eb; background:#2563eb; color:#fff; box-shadow:0 2px 12px rgba(37,99,235,.35); }
+.lpm-foot { padding:0 22px 20px; }
+.lpm-save-btn { width:100%; display:flex; align-items:center; justify-content:center; gap:8px; padding:12px 22px; background:linear-gradient(135deg,#1e40af,#2563eb); color:#fff; border:none; border-radius:12px; font-size:14px; font-weight:700; cursor:pointer; font-family:'Inter',sans-serif; }
+.lpm-save-btn:hover { opacity:.92; }
+</style>
+
+
+--------------------------------------------------------------------------------
+C. AUDIO RECORDING, RESAMPLING & API INTEGRATION (analytics/static/app.js)
+--------------------------------------------------------------------------------
+var voiceBtn        = document.getElementById('chatVoiceBtn');
+var voiceBtnLabel   = document.getElementById('chatVoiceBtnLabel');
+var voiceBanner     = document.getElementById('chatVoiceBanner');
+var voiceBannerText = document.getElementById('chatVoiceBannerText');
+var langPrefModal   = document.getElementById('langPrefModal');
+var langPrefSaveBtn = document.getElementById('langPrefSaveBtn');
+var langPrefGrid    = document.getElementById('langPrefGrid');
+
+var voiceRecording  = false;
+var voiceStream     = null;
+var voiceAudioCtx   = null;
+var voiceProcessor  = null;
+var voiceInput      = null;
+var voicePcmBufs    = [];
+var voiceSrcRate    = 48000;
+
+var langPrefSet     = false;
+var selected3rdLang = 'ta-IN';
+
+// 1. Fetch & Cache Language Preference
+async function checkLangPref(staffUid) {
+  if (!staffUid) return;
+  var localKey = 'sfa_lang_pref_set_' + staffUid;
+  if (localStorage.getItem(localKey) === 'true') {
+    langPrefSet = true;
+    return;
+  }
+  try {
+    var r = await fetch(API + '/api/speech/lang-pref?uid=' + staffUid);
+    var d = await r.json();
+    if (d && d.pref_set) {
+      langPrefSet = true;
+      localStorage.setItem(localKey, 'true');
+    } else {
+      langPrefSet = false;
+    }
+  } catch(e) {
+    console.warn('Failed to fetch lang pref', e);
+  }
+}
+
+// 2. Language Chip Selection Listener
+if (langPrefGrid) {
+  langPrefGrid.addEventListener('click', function(e) {
+    var chip = e.target.closest('.lpm-chip');
+    if (!chip) return;
+    langPrefGrid.querySelectorAll('.lpm-chip').forEach(function(c) { c.classList.remove('selected'); });
+    chip.classList.add('selected');
+    selected3rdLang = chip.dataset.lang;
+  });
+}
+
+// 3. Save Preference Handler
+if (langPrefSaveBtn) {
+  langPrefSaveBtn.addEventListener('click', async function() {
+    var staffUid = uid();
+    if (!staffUid) return;
+    langPrefSaveBtn.disabled = true;
+    try {
+      await fetch(API + '/api/speech/lang-pref', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uid: staffUid, third_lang: selected3rdLang })
+      });
+      localStorage.setItem('sfa_lang_pref_set_' + staffUid, 'true');
+      langPrefSet = true;
+      langPrefModal.classList.remove('show');
+      startVoice();
+    } catch(e) {
+      alert('Failed to save preference: ' + e.message);
+    } finally {
+      langPrefSaveBtn.disabled = false;
+    }
+  });
+}
+
+// 4. Audio Processing Helpers (Resample -> PCM16 -> WAV -> Base64)
+function resampleAudio(src, srcRate, tgtRate) {
+  if (srcRate === tgtRate) return src;
+  var ratio = tgtRate / srcRate;
+  var out = new Float32Array(Math.round(src.length * ratio));
+  for (var i = 0; i < out.length; i++) {
+    var pos = i / ratio;
+    var idx = Math.floor(pos);
+    var frac = pos - idx;
+    var a = src[idx] || 0;
+    var b = src[idx + 1] || 0;
+    out[i] = a + frac * (b - a);
+  }
+  return out;
+}
+
+function floatTo16Bit(pcm) {
+  var out = new Int16Array(pcm.length);
+  for (var i = 0; i < pcm.length; i++) {
+    var s = Math.max(-1, Math.min(1, pcm[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+
+function encodeWav(pcm16, sampleRate) {
+  var buf = new ArrayBuffer(44 + pcm16.length * 2);
+  var view = new DataView(buf);
+  function writeStr(off, str) { for (var i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); }
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + pcm16.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, pcm16.length * 2, true);
+  for (var i = 0; i < pcm16.length; i++) view.setInt16(44 + i * 2, pcm16[i], true);
+  return new Uint8Array(buf);
+}
+
+// 5. Start Recording
+async function startVoice() {
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch(e) {
+    alert('Microphone access denied: ' + e.message);
+    return;
+  }
+  voiceAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  voiceSrcRate  = voiceAudioCtx.sampleRate;
+  voiceInput    = voiceAudioCtx.createMediaStreamSource(voiceStream);
+  voiceProcessor = voiceAudioCtx.createScriptProcessor(4096, 1, 1);
+  voiceProcessor.onaudioprocess = function(e) {
+    var chunk = e.inputBuffer.getChannelData(0);
+    voicePcmBufs.push(new Float32Array(chunk));
+  };
+  voiceInput.connect(voiceProcessor);
+  voiceProcessor.connect(voiceAudioCtx.destination);
+  voicePcmBufs = [];
+  voiceRecording = true;
+
+  voiceBtn.className = 'chat-voice-btn recording';
+  voiceBtnLabel.textContent = 'Stop';
+  voiceBanner.className = 'chat-voice-banner show';
+  voiceBannerText.textContent = 'Listening\u2026 speak your question, then click Stop';
+  chatInput.placeholder = 'Listening\u2026';
+}
+
+// 6. Stop Recording & Send for Transcription
+async function stopVoice() {
+  if (!voiceRecording) return;
+  voiceRecording = false;
+
+  if (voiceStream) voiceStream.getTracks().forEach(function(t) { t.stop(); });
+  if (voiceInput)  voiceInput.disconnect();
+  if (voiceProcessor) voiceProcessor.disconnect();
+
+  voiceBtn.className = 'chat-voice-btn idle';
+  voiceBtnLabel.textContent = 'Voice';
+  chatInput.placeholder = 'Ask a question...';
+
+  if (!voicePcmBufs.length) {
+    voiceBanner.className = 'chat-voice-banner';
+    alert('No audio captured.');
+    return;
+  }
+
+  voiceBanner.className = 'chat-voice-banner show transcribing';
+  voiceBannerText.textContent = 'Transcribing your speech\u2026';
+
+  var totalLen = voicePcmBufs.reduce(function(s, b) { return s + b.length; }, 0);
+  var combined = new Float32Array(totalLen);
+  var off = 0;
+  voicePcmBufs.forEach(function(b) { combined.set(b, off); off += b.length; });
+
+  var resampled = resampleAudio(combined, voiceSrcRate, 16000);
+  var pcm16     = floatTo16Bit(resampled);
+  var wavBytes  = encodeWav(pcm16, 16000);
+
+  var binStr = '';
+  for (var i = 0; i < wavBytes.length; i++) binStr += String.fromCharCode(wavBytes[i]);
+  var b64 = btoa(binStr);
+
+  try {
+    var r = await fetch('/api/speech/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio_b64: b64, sample_rate_hz: 16000, uid: uid() }),
+    });
+    var d = await r.json();
+    if (d && d.transcript) {
+      chatInput.value = d.transcript;
+      chatInput.focus();
+    } else {
+      alert('No speech detected. Please try again.');
+    }
+  } catch(e) {
+    alert('Transcription failed: ' + e.message);
+  } finally {
+    voiceBanner.className = 'chat-voice-banner';
+    voicePcmBufs = [];
+  }
+}
+
+// 7. Voice Button Click Trigger (First-Use Modal Check)
+voiceBtn.addEventListener('click', function() {
+  if (voiceRecording) {
+    stopVoice();
+    return;
+  }
+  var staffUid = uid();
+  if (!staffUid) {
+    alert('Please select a Staff Member first.');
+    return;
+  }
+  if (!langPrefSet) {
+    langPrefModal.classList.add('show');
+    return;
+  }
+  startVoice();
+});
+================================================================================

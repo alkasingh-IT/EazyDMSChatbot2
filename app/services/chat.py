@@ -5,6 +5,7 @@ executes the query, and generates an AI answer.
 import json
 import logging
 import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .llm import call_llm_json, call_llm_text
@@ -29,22 +30,54 @@ except (ImportError, AttributeError):
 from ..analytics import ALL_FLAGS
 
 
-def _output_lang_rule(output_lang: str) -> str:
-    """Prompt block forcing the reply language when the user picked one."""
+def _output_lang_rule(output_lang: str, output_script: str = "native") -> str:
+    """Prompt block forcing the reply language and script when the user picked an override."""
+    script_mode = (output_script or "native").strip().lower()
+    if script_mode not in ("native", "roman"):
+        script_mode = "native"
+
     if not output_lang or output_lang == "auto":
+        if script_mode == "roman":
+            return (
+                "\nCRITICAL LANGUAGE & SCRIPT RULE: You MUST respond in the EXACT same language as the user. "
+                "If the user asks in pure English, you MUST respond ONLY in pure English. "
+                "If the user asks in an Indian language or Hinglish, respond using the Roman/Latin alphabet (transliterated). "
+                "Do NOT use regional native script characters."
+            )
         return (
-            "\nLANGUAGE:\n"
-            "- Detect the language of the user's question and respond in the SAME language.\n"
-            "- NEVER mix languages unexpectedly — stay consistent within each reply.\n"
+            "\nCRITICAL LANGUAGE RULE: You MUST respond in the EXACT same language as the user. "
+            "If the user asks in pure English, you MUST respond ONLY in pure English. "
+            "If the user asks in Hinglish, respond in Hinglish."
         )
+
     label = OUTPUT_LANG_LABELS.get(output_lang, output_lang)
+    short = label.split(" (", 1)[0].strip()
+
+    script_instruction = ""
+    if output_lang != "en-IN":
+        if script_mode == "roman":
+            script_instruction = (
+                f"\nSTRICT SCRIPT REQUIREMENT — ROMAN / LATIN ALPHABET ONLY:\n"
+                f"The user has explicitly selected Roman script for {short}. "
+                f"You MUST write your entire response using the vocabulary, grammar, and expressions of {short}, "
+                f"but write it STRICTLY transliterated into the Latin/English alphabet (Roman script). "
+                f"DO NOT use native non-Latin script characters under any circumstances! "
+                f"Example: write 'Aapka secondary sales data yahan hai' NOT Devanagari script.\n"
+            )
+        else:
+            script_instruction = (
+                f"\nSTRICT SCRIPT REQUIREMENT — NATIVE REGIONAL SCRIPT ONLY:\n"
+                f"The user has explicitly selected Native script for {short}. "
+                f"Write your response using the authentic native script of {short}.\n"
+            )
+
     return (
         f"\nOUTPUT LANGUAGE OVERRIDE — HIGHEST PRIORITY:\n"
         f"- The user has chosen '{label}' as their preferred answer language.\n"
-        f"- Write your ENTIRE response in {label.split(' ')[-1] if ' ' in label else label} "
-        f"(language code {output_lang}) REGARDLESS of the language of the user's question.\n"
-        f"- Numbers, currency amounts, person/dealer/item names, and codes stay exactly as they appear in the data — never translate them.\n"
+        f"- Write your ENTIRE response in {short} (language code {output_lang}) REGARDLESS of the language of the user's question.\n"
+        f"- Numbers, currency amounts, person/dealer/distributor/item names, and codes stay exactly as they appear in the data — never translate them.\n"
         f"- Section labels (Summary / Key Numbers / Trend / Actions) must also be written in the chosen language.\n"
+        f"{script_instruction}"
     )
 
 
@@ -110,14 +143,182 @@ def _build_flag_menu() -> str:
 FLAG_MENU = _build_flag_menu()
 
 
-def route_question(question: str, userid: str, staff_context: Dict = None, history: List[Dict] = None) -> Dict[str, Any]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Response-shape engine (model-decided, data-validated)
+# The routing LLM picks the shape alongside the flags; Python validates it
+# against the EXECUTED data and only ever upgrades to the safe full format.
+# The shape gates WHICH blocks render — it never supplies or alters a number.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHAPE_KINDS = ("lookup", "comparison", "ranking", "trend", "analytical", "general")
+_SHAPE_LOG_PATH = Path(__file__).resolve().parent.parent / "metadata_reports" / "shape_decisions.jsonl"
+
+
+def _parse_response_shape(routing_raw: Any) -> Dict[str, Any]:
+    """Extract response_shape from the routing JSON. Missing/invalid → analytical default."""
+    raw = routing_raw.get("response_shape") if isinstance(routing_raw, dict) else None
+    kind, reasoning = "", ""
+    if isinstance(raw, dict):
+        kind = str(raw.get("kind") or "").strip().lower()
+        reasoning = str(raw.get("reasoning") or "").strip()[:300]
+    elif isinstance(raw, str):
+        kind = raw.strip().lower()
+    if kind not in _SHAPE_KINDS:
+        return {"kind": "analytical", "reasoning": "router gave no valid shape; defaulting", "upgraded": False}
+    return {"kind": kind, "reasoning": reasoning, "upgraded": False}
+
+
+def _has_time_column(cols: List[str]) -> bool:
+    keys = ("date", "day", "month", "quarter", "year", "time", "period", "week")
+    return any(any(k in str(c).lower() for k in keys) for c in (cols or []))
+
+
+def _has_numeric_value_column(rows: List[Dict], cols: List[str]) -> bool:
+    import decimal as _decimal
+    for c in (cols or []):
+        if c.startswith("_") or "uid" in str(c).lower():
+            continue
+        for r in (rows or [])[:5]:
+            v = r.get(c)
+            if v is None or isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) or isinstance(v, _decimal.Decimal):
+                return True
+            try:
+                float(str(v).replace(",", "").strip())
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _validate_shape_against_data(
+    shape: Dict[str, Any],
+    executed_data: List[Dict[str, Any]],
+    flag_selection: List[str],
+) -> Dict[str, Any]:
+    """
+    Cross-check the router's shape against the REAL executed data. Failed checks
+    upgrade the shape to 'analytical' (full format) — a wrong choice can only
+    degrade presentation, never emit wrong or missing data.
+    """
+    kind = shape.get("kind")
+    if kind == "general":
+        if (executed_data or flag_selection):
+            return {**shape, "kind": "analytical", "upgraded": True,
+                    "upgrade_reason": "general chosen but flags were selected; data must be shown"}
+        return shape
+    if kind == "analytical":
+        return shape
+
+    paired = [
+        ((ds.get("rows_full") or ds.get("rows") or []), (ds.get("columns") or []))
+        for ds in (executed_data or [])
+        if isinstance(ds, dict) and not ds.get("error")
+        and len(ds.get("rows") or ds.get("rows_full") or []) > 0
+    ]
+
+    def _upgrade(reason: str) -> Dict[str, Any]:
+        return {**shape, "kind": "analytical", "upgraded": True, "upgrade_reason": reason}
+
+    if kind == "comparison":
+        if len(paired) < 2:
+            return _upgrade(f"comparison needs ≥2 non-empty data slices; got {len(paired)}")
+        return shape
+    if kind == "trend":
+        if not paired:
+            return _upgrade("trend needs data; none returned")
+        rows0, cols0 = paired[0]
+        if len(rows0) < 2 or not _has_time_column(cols0):
+            return _upgrade("trend needs ≥2 time-ordered rows with a time column")
+        return shape
+    if kind == "ranking":
+        if not paired:
+            return _upgrade("ranking needs data; none returned")
+        rows0, cols0 = paired[0]
+        if not _has_numeric_value_column(rows0, cols0) or len(rows0) < 2:
+            return _upgrade("ranking needs ≥2 rows with a numeric value column")
+        return shape
+    if kind == "lookup":
+        if len(paired) > 1 or (paired and len(paired[0][0]) > 3):
+            return _upgrade("lookup expects a single small result set")
+        return shape
+    return shape
+
+
+def _shape_rule(shape: Dict[str, Any]) -> str:
+    """Answer-style block appended to the analytical system prompt."""
+    kind = (shape or {}).get("kind") or "analytical"
+    if kind == "lookup":
+        return (
+            "\n\nANSWER SHAPE FOR THIS TURN: LOOKUP — OVERRIDES the default structure choice.\n"
+            "The user asked a single-fact question. Use the COMPACT STRUCTURE: the bold direct answer line plus 2-3 short supporting bullets, nothing more.\n"
+            "Do NOT use the FULL STRUCTURE sections."
+        )
+    if kind == "comparison":
+        return (
+            "\n\nANSWER SHAPE FOR THIS TURN: COMPARISON — OVERRIDES the default structure choice.\n"
+            "Lead with a compact markdown TABLE comparing both sides — one row per metric, one column per side "
+            "(e.g. | Metric | Side A | Side B |), using ONLY figures present in the data. If a metric is missing for "
+            "one side, omit that row rather than guessing.\n"
+            "After the table, 3-4 lines: the difference, the % change, and which side is ahead.\n"
+            "Do NOT use the FULL STRUCTURE sections (no Trend / 3 Actions lists)."
+        )
+    if kind == "ranking":
+        return (
+            "\n\nANSWER SHAPE FOR THIS TURN: RANKING — OVERRIDES the default structure choice.\n"
+            "Show the top entries as a compact markdown TABLE (| # | Name | Value | Share% |), then one closing line "
+            "highlighting the leader. Use ONLY names and figures from the data; never add entries that are not present.\n"
+            "Do NOT use the FULL STRUCTURE sections."
+        )
+    if kind == "trend":
+        return (
+            "\n\nANSWER SHAPE FOR THIS TURN: TREND — OVERRIDES the default structure choice.\n"
+            "Answer in 2-4 lines: direction, momentum, and any notable shift; the chart renders automatically as the hero.\n"
+            "Do NOT use the FULL STRUCTURE sections."
+        )
+    return ""
+
+
+def _log_shape_decision(
+    question: str,
+    flag_selection: List[str],
+    shape: Dict[str, Any],
+    uid: str,
+) -> None:
+    """Append the shape decision to a JSONL audit log (best-effort, never blocks)."""
+    try:
+        rec = {
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "uid": (uid or "")[:64],
+            "question": (question or "")[:200],
+            "flags": [str(f or "") for f in (flag_selection or [])][:8],
+            "kind": shape.get("kind"),
+            "reasoning": shape.get("reasoning", "")[:300],
+            "upgraded": bool(shape.get("upgraded")),
+            "upgrade_reason": shape.get("upgrade_reason", ""),
+        }
+        _SHAPE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SHAPE_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def route_question(question: str, userid: str, staff_context: Dict = None, history: List[Dict] = None, output_lang: str = 'auto', output_script: str = 'native') -> Dict[str, Any]:
     """
     Step 1 — Ask the LLM which flag (if any) best answers the question.
-    Returns {"flag": str, "params": dict} or {"flag": null} for general chat.
+    Returns {"flags", "params", "direct_answer", "response_shape"} — the same
+    routing call also decides the presentation kind (response-shape engine).
     """
     staff_info = ""
+    raw_name = (staff_context or {}).get('name') or userid
+    raw_desig = (staff_context or {}).get('designation') or 'Staff'
+    is_firm = any(t in str(raw_name).upper() for t in ["TRADERS", "ENTERPRISES", "AGENCIES", "DISTRIBUTORS", "PVT LTD", "LTD", "STORE", "CENTRE", "LLP", "COMPANY"])
     if staff_context:
-        staff_info = f"You are assisting: {staff_context.get('name')} ({staff_context.get('designation', 'Staff')}).\n"
+        firm_note = f" (Corporate Distributor Firm Entity: {raw_name})" if is_firm else ""
+        staff_info = f"LOGGED-IN PROFILE: Name/Firm='{raw_name}', Designation='{raw_desig}'{firm_note}.\n"
+
 
     # Extract previous topic from last assistant message for continuity
     prev_topic = ""
@@ -165,6 +366,49 @@ def route_question(question: str, userid: str, staff_context: Dict = None, histo
         "When the user says 'all sales', 'entire data', 'everyone', 'whole country', 'my team data', or similar — "
         "they mean everything within this combined scope. Route normally; do NOT treat it as an out-of-scope request.\n"
         "Given a user question and the conversation history above, select the BEST analytics flag(s) from the list below.\n"
+        "SELECTION RULES (follow strictly):\n"
+        "0. GENERAL & CONVERSATIONAL QUESTIONS — AUTONOMOUS INTELLECTUAL RESOLUTION (SELECT NO FLAGS):\n"
+        "   You possess advanced natural language understanding. Autonomously analyze the user's intent. Any question that does NOT require querying specific operational database records (e.g. transactional sales numbers, order lists, inventory stock, purchase orders, claims) is a GENERAL QUESTION.\n\n"
+        "   CRITICAL STEP-1 RESOLUTION RULE:\n"
+        "   Whenever the user asks a general or conversational question:\n"
+        "   → Select NO flags: \"flags\": []\n"
+        "   → Synthesize your complete, articulate, beautifully formatted answer directly in the \"direct_answer\" field of your JSON response!\n"
+        "   → Do NOT leave \"direct_answer\" empty or null for these questions.\n"
+        "   → Do NOT rely on rigid keywords — use your semantic intelligence to understand the user's meaning in ANY phrasing, dialect, language, slang, or typo (English, Hindi, Hinglish in Roman script, etc.).\n\n"
+        "   General Question Domains (autonomously recognize and resolve):\n"
+        "   a) USER IDENTITY & PROFILE:\n"
+        "      - Any question asking who they are, their name, designation, firm details, or who is logged in.\n"
+        "      - Examples: 'who am I', 'mera naam kya h', 'mera naam batao', 'bhai m kaun hu', 'main kaun hoon', 'meri details', 'what is my designation', 'meri profile dikhao', 'kiske account se login hu', 'who is authenticated'.\n"
+        "      - CORPORATE / DISTRIBUTOR ACCOUNT IDENTITY RULE:\n"
+        "        * Look at the LOGGED-IN PROFILE above.\n"
+        "        * If the Account Name represents a distributor / corporate entity (e.g. contains TRADERS, ENTERPRISES, AGENCIES, DISTRIBUTORS, PVT LTD, LTD, etc.):\n"
+        "          Explain clearly and politely that they are authenticated in the DMS portal under the authorized distributor/corporate account of **{raw_name}**.\n"
+        "          Mention that all primary purchases, secondary liquidation, stock movement, and claims are scoped to this entity.\n"
+        "          NEVER claim or say that the user's personal human name is the corporate distributor firm!\n"
+        "        * If the profile contains an individual human name, greet them warmly by their name and state their designation.\n\n"
+        "   b) SYSTEM & ASSISTANT IDENTITY:\n"
+        "      - Any query asking who you are, what is Eazy AI, or your purpose.\n"
+        "      - Examples: 'who are you', 'tum kaun ho', 'apna parichay do', 'what is this system', 'introduce yourself', 'kya ho tum'.\n"
+        "      - Explain that you are Eazy AI — the dedicated Distributor Management System (DMS) Executive Intelligence Assistant, designed to analyze distributor purchases, secondary sales liquidation, stock movement, clearance health, and claims.\n\n"
+        "   c) GREETINGS, WELL-BEING & RAPPORT:\n"
+        "      - Salutations, friendly check-ins, well-wishing in any natural language or slang.\n"
+        "      - Examples: 'kaise ho', 'kese ho', 'kya haal hai', 'kaisa chal raha hai', 'how are you', 'how\'s it going', 'hi', 'hello', 'namaste', 'good morning', 'wassup', 'kem cho'.\n"
+        "      - Respond warmly and professionally, noting that you are operating at peak analytical capacity and ready to assist with DMS operations.\n\n"
+        "   d) CAPABILITIES, GUIDANCE & HELP:\n"
+        "      - Asking what you can do, what questions can be asked, asking for examples.\n"
+        "      - Examples: 'what can you do', 'kya kar sakte ho', 'help', 'guide', 'menu', 'sample questions', 'options dikhao'.\n"
+        "      - Provide a clean, structured overview of capabilities (Secondary Sales, Primary Purchases, Stock Movement & Health, Dead Stock Clearance, Schemes & Claims) with 3-4 example questions.\n\n"
+        "   e) FMCG & DMS DOMAIN CONCEPTS & DEFINITIONS:\n"
+        "      - Asking to explain a business term, formula, or concept without querying specific transactional data.\n"
+        "      - Examples: 'what is secondary sales', 'difference between primary and secondary sales', 'what is dead stock', 'what is stock cover', 'what is claim settlement ratio'.\n"
+        "      - Provide an authoritative, clear, and concise FMCG/DMS explanation tailored for commercial and distributor leadership.\n\n"
+        "   f) COURTESIES, APPRECIATION & FAREWELLS:\n"
+        "      - 'thank you', 'thanks', 'dhanyawad', 'shukriya', 'great job', 'awesome', 'bye', 'good night', 'ok', 'got it', 'noted'.\n"
+        "      - Respond graciously and invite them to ask their next business question whenever ready.\n\n"
+        "   STYLING OF direct_answer:\n"
+        "   - Use clean markdown with **bold** text and bullet points.\n"
+        "   - Respect the requested language and script.\n"
+        f"{_output_lang_rule(output_lang, output_script)}\n\n"
         "Read flag descriptions carefully. The [PUR]/[SS]/[PR]/[SC]/[SM]/[ALL] prefix tells you the module.\n"
         "CRITICAL MODULE DISAMBIGUATION — [SC] vs [SM] — READ CAREFULLY:\n"
         "- [SC] = Stock CLEARANCE — use for questions about dead stock, slow-moving stock, stock health, expiry risk, "
@@ -180,6 +424,33 @@ def route_question(question: str, userid: str, staff_context: Dict = None, histo
         "return {\"flags\": []}. Those are NOT analytics questions.\n"
         "CRITICAL: Use the conversation history to infer months, modules, or context the user didn't re-state. "
         f"E.g., if the previous question was about 'purchases for march' and now they say 'month wise data', route to purchases monthly-summary with March dates.{prev_topic}\n"
+        "CRITICAL — TWO-PERIOD COMPARISON QUESTIONS (\"q1 vs q2\", \"this month vs last month\", \"Q1 2025 vs Q2 2025\", "
+        "\"compare X and Y periods\"):\n"
+        "- ALWAYS use the module's -compare-periods flag (ss:compare-periods / pur:compare-periods / pr:compare-periods) "
+        "with FOUR params: date_from_1, date_to_1, date_from_2, date_to_2 (period 1 and period 2, YYYY-MM-DD).\n"
+        "- Example: 'secondary sales q1 vs q2 2025' → flag ss:compare-periods, params "
+        "{\"date_from_1\": \"2025-01-01\", \"date_to_1\": \"2025-03-31\", \"date_from_2\": \"2025-04-01\", \"date_to_2\": \"2025-06-30\"}.\n"
+        "- NEVER route a comparison to -monthly-summary, -summary or full-year dates — those answer ONE period, not two.\n"
+        "\n"
+        "SPECIAL PARAM CHEAT-SHEET — use the EXACT param names below; ALWAYS pass entity names exactly as the user wrote them:\n"
+        "- Entity lookups — pass the NAME (or code) the user mentioned, never invent an internal ID:\n"
+        "  * mst:distributor-detail → {\"distributor_name\": \"<name or code>\"}\n"
+        "  * mst:item-detail → {\"item_name\": \"<name or code>\"} (optionally division_name)\n"
+        "  * sch:scheme-details → {\"scheme_name\": \"<name or code>\"}\n"
+        "  * clm:status → {\"claim_no\": \"<claim number>\"} (or claim_id)\n"
+        "  * pur:item-history → {\"item_name\": \"<item name or code>\"} (or item_id)\n"
+        "  * combined:distributor-snapshot / combined:distributor-deep → {\"distributor_name\": \"<name>\"} (or distributor_id)\n"
+        "- Comparing TWO or more distributors → ss:/pur:/pr:distributor-compare with "
+        "{\"distributor_names\": \"Name A, Name B\"} (or distributor_ids) plus date_from/date_to.\n"
+        "- Top-N by a specific grouping (custom-top flags) → {\"group_col\": \"ds_name|dealer_name|item_name|item_group|item_division\", "
+        "\"metric\": \"billed_value|billed_qty\", \"order\": \"desc|asc\", \"limit\": N}. "
+        "e.g. 'top 5 distributors by quantity' → ss:custom-top with group_col=ds_name, metric=billed_qty.\n"
+        "- by-category flags → optional {\"category_column\": \"item_group|item_division\"}.\n"
+        "- filtered flags → {\"filter_col\": \"<column>\", \"filter_op\": \"=|>|<|>=|<=|LIKE\", \"filter_val\": \"<value>\"}.\n"
+        "- sm:closing-stock / sm:stock-statement → optional {\"group_by\": \"distributor|zone|state|item\"}; "
+        "sm:stock-cover → optional {\"cover_type\": \"low|overstock\"}; sm:misc-adjustments → optional {\"adj_type\": \"in|out\"}.\n"
+        "- Flags marked 'this month' / 'current month' in their description ALWAYS answer the CURRENT month "
+        "regardless of dates — never pick them for a historical period.\n"
         "When the user asks for 'breakdown' or 'overview', select up to 2 complementary lightweight flags — "
         "prefer the -summary flag plus one -by-* flag (e.g., monthly-summary + by-category). "
         "NEVER include flags ending in -monthly (distributor-monthly, item-monthly, category-monthly) — "
@@ -192,7 +463,27 @@ def route_question(question: str, userid: str, staff_context: Dict = None, histo
         "- If the user names an explicit month (e.g. 'March'), use its first and last calendar day of the CURRENT year unless they say otherwise.\n\n"
         f"{_build_date_reference(today)}\n\n"
         "If none of the flags are relevant, return {\"flags\": []}.\n"
-        "Return ONLY valid JSON with keys: flags (array of strings, at least 1 if relevant), params (object, applied to ALL flags).\n\n"
+        "\n"
+        "RESPONSE SHAPE — how the answer should be PRESENTED (decide carefully):\n"
+        "In the SAME JSON you return, also add a \"response_shape\" describing what KIND of\n"
+        "answer the user's question needs. Judge the question's INTENT with your own\n"
+        "semantic understanding (any language, any phrasing) — do NOT pattern-match keywords.\n"
+        "Choose exactly ONE kind:\n"
+        "- \"general\"    : needs NO operational data (greeting, identity, concept explanation, help, courtesy).\n"
+        "- \"lookup\"     : a single fact or a small set of figures, nothing more (one period's total, one count, one distributor's number).\n"
+        "- \"comparison\" : the question EXPLICITLY compares TWO concrete things — two periods (Q1 vs Q2, this month vs last month) or two named distributors/items. In \"reasoning\" you MUST name BOTH things being compared. A breakdown list or a broad overview is NOT a comparison.\n"
+        "- \"trend\"      : asks HOW something evolves over time (month-wise, day-wise, over the last 6 months) and the time axis is the hero.\n"
+        "- \"ranking\"    : asks for ordering / best / worst / top-N (\"which distributor is highest\", \"top 5 items\", \"who has the most\").\n"
+        "- \"analytical\" : everything else — synthesis, overview, multi-part questions, or whenever you are genuinely unsure. Uncertainty ALWAYS defaults here.\n"
+        "Rules:\n"
+        "- Always include response_shape (never null, never missing).\n"
+        "- The kind must be supported by the flags you selected: for trend, the selected flags must return time-wise data; for comparison, both sides must be answerable from your selected flags.\n"
+        "- Only the PRESENTATION type is decided here. Never invent or alter any data in this field.\n\n"
+        "Return ONLY valid JSON with keys:\n"
+        "  - flags: array of strings (empty [] if general question)\n"
+        "  - params: object (applied to ALL flags)\n"
+        "  - direct_answer: string (full markdown answer if general question, null/empty if flags are selected)\n"
+        "  - response_shape: object {\"kind\": \"lookup|comparison|ranking|trend|analytical|general\", \"reasoning\": \"<one short line>\"}\n\n"
         f"Available flags:\n{FLAG_MENU}"
     )
     logger = logging.getLogger("dms.chat")
@@ -208,18 +499,20 @@ def route_question(question: str, userid: str, staff_context: Dict = None, histo
 
     if not isinstance(result, dict):
         logger.warning("\033[1;31m[ROUTING FAIL]\033[0m Routing returned non-dict for '%s': %s", question[:80], result)
-        return {"flags": [], "params": {}}
+        return {"flags": [], "params": {}, "response_shape": {"kind": "analytical", "reasoning": "routing returned non-dict; defaulting", "upgraded": False}}
     flags = result.get("flags")
     if isinstance(flags, str):
         flags = [flags]
     if not isinstance(flags, list):
         flags = [result.get("flag")] if result.get("flag") else []
 
+    direct_ans = (result.get("direct_answer") or "").strip()
+    shape = _parse_response_shape(result)
     logger.info(
-        "\033[1;35m[DECODED ROUTING INTENT]\033[0m Decoded Flags: \033[1;32m%s\033[0m | Decoded Params: \033[1;36m%s\033[0m",
-        flags, result.get("params") or {}
+        "\033[1;35m[DECODED ROUTING INTENT]\033[0m Decoded Flags: \033[1;32m%s\033[0m | Decoded Params: \033[1;36m%s\033[0m | Has Direct Answer: %s | Shape: %s",
+        flags, result.get("params") or {}, bool(direct_ans), shape.get("kind")
     )
-    return {"flags": flags, "params": result.get("params") or {}}
+    return {"flags": flags, "params": result.get("params") or {}, "direct_answer": direct_ans, "response_shape": shape}
 
 
 _FALLBACK_SUGGESTIONS = [
@@ -337,11 +630,18 @@ def get_scope_suggestions(userid: str = "", db_uid: str = None) -> List[str]:
         return random.sample(_FALLBACK_SUGGESTIONS, min(5, len(_FALLBACK_SUGGESTIONS)))
 
 
-def generate_answer(question: str, flag: str, execution: Dict[str, Any], staff_context: Dict = None, history: List[Dict] = None, multi_flags: List[str] = None, scope_suggestions: List[str] = None, output_lang: str = "auto") -> str:
-    """
-    Step 2 — Generate a natural-language answer from the query result.
-    multi_flags: list of flag names when multiple were executed for one answer.
-    """
+def build_answer_prompts(
+    question: str,
+    flag: str,
+    execution: Dict[str, Any],
+    staff_context: Dict = None,
+    history: List[Dict] = None,
+    multi_flags: List[str] = None,
+    scope_suggestions: List[str] = None,
+    output_lang: str = "auto",
+    output_script: str = "native",
+    shape: Dict[str, Any] = None,
+) -> tuple:
     rows = execution.get("rows") or []
     cols = execution.get("columns") or []
     row_count = execution.get("row_count", 0)
@@ -465,10 +765,10 @@ def generate_answer(question: str, flag: str, execution: Dict[str, Any], staff_c
         "\n"
         "- When multiple data sources report different totals for the same thing, prefer the per-entity breakdown "
         "(by-distributor / by-item / by-month rows) over merged summary totals — sum the breakdown rows as the true total.\n"
-        + _output_lang_rule(output_lang)
+        + _output_lang_rule(output_lang, output_script)
+        + _shape_rule(shape)
     )
 
-    # Pre-LLM enrichment: totals, growth, top/bottom performers computed in Python
     facts_block = ""
     if row_count > 0:
         try:
@@ -496,13 +796,33 @@ def generate_answer(question: str, flag: str, execution: Dict[str, Any], staff_c
         + (f"{facts_block}\n\n" if facts_block else "")
         + f"Rows shown to you:\n{json.dumps(safe_rows, ensure_ascii=False, default=str)}"
     )
+    return system, user
+
+
+def generate_answer(
+    question: str,
+    flag: str,
+    execution: Dict[str, Any],
+    staff_context: Dict = None,
+    history: List[Dict] = None,
+    multi_flags: List[str] = None,
+    scope_suggestions: List[str] = None,
+    output_lang: str = "auto",
+    output_script: str = "native",
+    shape: Dict[str, Any] = None,
+) -> str:
+    system, user = build_answer_prompts(
+        question, flag, execution, staff_context, history, multi_flags, scope_suggestions, output_lang, output_script, shape
+    )
     ans = call_llm_text(system=system, user=user)
+    name = (staff_context or {}).get("name", "there")
     logger = logging.getLogger("dms.chat")
     logger.info(
         "\033[1;32m[SYSTEM ANSWER GENERATED]\033[0m User: %s | Length: %d chars | Preview: '\033[1;37m%.150s...\033[0m'",
         name, len(ans), ans.replace("\n", " ")
     )
     return ans
+
 
 
 
@@ -605,4 +925,3 @@ def suggest_chart(question: str, execution: Dict[str, Any]) -> Dict[str, Any]:
         ct, x, y, cols, len(rows)
     )
     return {"chart_type": ct, "x": x, "y": y, "rows": rows}
-

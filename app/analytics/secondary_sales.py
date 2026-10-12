@@ -116,8 +116,14 @@ def q6_trend_3m(userid, params=None):
 
 def q17_compare_periods(userid, params=None):
     p = params or {}; rbac = rbac_clause(p); qp = build_params(userid, p)
-    if p.get("date_from") and p.get("date_to"):
-        from datetime import datetime, timedelta
+    from datetime import datetime, timedelta
+    if p.get("date_from_1") and p.get("date_to_1") and p.get("date_from_2") and p.get("date_to_2"):
+        # Router style: BOTH periods supplied explicitly (e.g. Q1 vs Q2)
+        qp["cur_from"] = str(p["date_from_1"]); qp["cur_to"] = str(p["date_to_1"])
+        qp["prev_from"] = str(p["date_from_2"]); qp["prev_to"] = str(p["date_to_2"])
+        df = "AND td.vch_date >= :cur_from AND td.vch_date < :cur_to"
+        df_prev = "AND td.vch_date >= :prev_from AND td.vch_date < :prev_to"
+    elif p.get("date_from") and p.get("date_to"):
         d_from = datetime.strptime(str(p["date_from"]), "%Y-%m-%d").date()
         d_to = datetime.strptime(str(p["date_to"]), "%Y-%m-%d").date()
         span = (d_to - d_from).days + 1
@@ -673,11 +679,24 @@ def q31_pareto(userid, params=None):
 def q32_distributor_compare(userid, params=None):
     p = params or {}; df = _date_filter("td.vch_date", p); rbac = rbac_clause(p); qp = build_params(userid, p)
     ids = str(p.get("distributor_ids", "")).strip()
-    if not ids:
-        return {"rows": [], "columns": ["ds_code", "ds_name", "total", "invoices"], "row_count": 0, "error": "Provide distributor_ids (comma-separated)"}
-    placeholders = ",".join(f":did{i}" for i, _ in enumerate(ids.split(",")))
-    for i, did in enumerate(x.strip() for x in ids.split(",") if x.strip()):
+    names = str(p.get("distributor_names", "")).strip()
+    if not ids and not names:
+        return {"rows": [], "columns": ["ds_code", "ds_name", "total", "invoices"], "row_count": 0, "error": "Provide distributor_ids or distributor_names (comma-separated)"}
+    id_list = [x.strip() for x in ids.split(",") if x.strip()] if ids else []
+    name_list = [x.strip() for x in names.split(",") if x.strip()] if names else []
+    id_ph = ",".join(f":did{i}" for i in range(len(id_list)))
+    name_ph = ",".join(f":dname{i}" for i in range(len(name_list)))
+    for i, did in enumerate(id_list):
         qp[f"did{i}"] = did
+    for i, nm in enumerate(name_list):
+        qp[f"dname{i}"] = nm
+    match_sql = ""
+    if id_list and name_list:
+        match_sql = f"(CAST(td.distributorid AS TEXT) IN ({id_ph}) OR ds.ledgercode IN ({id_ph}) OR ds.ledgername IN ({name_ph}))"
+    elif id_list:
+        match_sql = f"(CAST(td.distributorid AS TEXT) IN ({id_ph}) OR ds.ledgercode IN ({id_ph}))"
+    else:
+        match_sql = f"ds.ledgername IN ({name_ph})"
     return run_query(f"""
         SELECT ds.ledgercode AS ds_code, ds.ledgername AS ds_name, SUM(td.billed_value) AS total,
                COUNT(DISTINCT td.vch_no) AS invoices,
@@ -686,7 +705,7 @@ def q32_distributor_compare(userid, params=None):
         FROM transactiondetail td INNER JOIN ({rbac}) accd ON accd.locationid=td.distributorid
         JOIN ledgermaster ds ON ds.ledgerid = td.distributorid AND ds.ledgertype = 1
         WHERE LOWER(td.trn_type)='sales' AND td.iscancelled IS DISTINCT FROM TRUE AND td.isdeleted IS DISTINCT FROM TRUE
-          AND (CAST(td.distributorid AS TEXT) IN ({placeholders}) OR ds.ledgercode IN ({placeholders})) {df}
+          AND {match_sql} {df}
         GROUP BY ds.ledgercode, ds.ledgername ORDER BY total DESC
     """, qp)
 
@@ -1180,10 +1199,10 @@ SECONDARY_SALES_FLAGS = {
     "ss:top-dealers":        (q5_top_dealers,        "Top dealers by secondary sales this month"),
     "ss:trend-3m":           (q6_trend_3m,           "Secondary sales trend last 3 months"),
     "ss:growth":             (q7_growth,             "Secondary sales growth vs last month"),
-    "ss:by-category":        (q8_by_category,        "Secondary sales by product category this month"),
-    "ss:by-so":              (q9_by_so,              "Secondary sales for specific SO this month [ASM+]"),
+    "ss:by-category":        (q8_by_category,        "Secondary sales by product category (date-range aware via date_from/date_to; defaults to this month)"),
+    "ss:by-so":              (q9_by_so,              "Secondary sales for specific SO (date-range aware; defaults to this month) [ASM+]"),
     "ss:team-by-so":         (q10_team_by_so,        "Team secondary sales by SO this week [ASM+]"),
-    "ss:top-so":             (q11_top_so,            "SO with highest secondary sales this month [ASM+]"),
+    "ss:top-so":             (q11_top_so,            "SO with highest secondary sales (date-range aware; defaults to this month) [ASM+]"),
     "ss:by-distributor":     (q12_by_distributor,    "Distributor-wise secondary sales for region [RSM+]"),
     "ss:compare-areas":      (q13_compare_areas,     "Compare secondary sales across all areas [RSM+]"),
     "ss:zone-quarter":       (q14_zone_quarter,      "Zone-wise secondary sales this quarter [ZSM+]"),
@@ -1218,13 +1237,13 @@ SECONDARY_SALES_FLAGS = {
     "ss:distributor-consistency":(q43_distributor_consistency, "Distributor consistency score by active months"),
     "ss:year-on-year":           (q44_year_on_year,        "Month-by-month secondary sales vs same month last year"),
     "ss:avg-invoice-per-dealer": (q45_avg_invoice_per_dealer, "Avg invoice value per dealer per distributor (AN1)"),
-    "ss:zero-sales-items":       (q46_zero_sales_items,       "SKUs with zero secondary sales this month vs last month (AN2)"),
+    "ss:zero-sales-items":       (q46_zero_sales_items,       "SKUs with zero secondary sales this month vs last month (AN2). CURRENT-month scan only — date params are ignored"),
     "ss:sales-per-active-dealer":(q47_sales_per_active_dealer, "Avg secondary sales value per active dealer per distributor (AN3)"),
     "ss:single-order-dealers":   (q48_single_order_dealers,   "Dealers with only 1 order this month (low engagement) (AN4)"),
     "ss:dealer-pareto":          (q49_dealer_pareto,          "Pareto 80-20 — % value from top 20% dealers (AN5)"),
-    "ss:new-dealer-activations": (q50_new_dealer_activations, "New dealers billed for the first time this month (AN6)"),
-    "ss:declining-distributors": (q51_declining_distributors, "Distributors that have NOT grown vs last month (AN7)"),
+    "ss:new-dealer-activations": (q50_new_dealer_activations, "New dealers billed for the first time this month (AN6). CURRENT-month scan only — date params are ignored"),
+    "ss:declining-distributors": (q51_declining_distributors, "Distributors that have NOT grown vs last month (AN7). CURRENT vs last month only — date params are ignored"),
     "ss:sales-per-dealer-per-day":(q52_sales_per_dealer_per_day,"Sales per active dealer per day productivity metric (AN8)"),
     "ss:rolling-velocity-trend": (q53_rolling_velocity_trend, "Rolling 3M vs 6M average sales velocity trend (AN9)"),
-    "ss:lost-item-distributor":  (q54_lost_item_distributor,  "Item-distributor combos with zero sales 2+ months but had sales before (AN10)"),
+    "ss:lost-item-distributor":  (q54_lost_item_distributor,  "Item-distributor combos with zero sales 2+ months but had sales before (AN10). CURRENT-month scan only — date params are ignored"),
 }

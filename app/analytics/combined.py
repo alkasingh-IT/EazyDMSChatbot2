@@ -291,8 +291,17 @@ def combined_distributor_snapshot(userid, params=None):
     """Single distributor detail across all 3 modules."""
     p = params or {}
     did = str(p.get("distributor_id", "")).strip()
+    dname = str(p.get("distributor_name", "")).strip()
+    if not did and dname:
+        # The router only knows the NAME the user gave — resolve it to the id.
+        _lk = run_query(
+            "SELECT ledgerid FROM ledgermaster WHERE ledgername ILIKE :dn LIMIT 1",
+            {"dn": f"%{dname}%"},
+        )
+        if _lk.get("rows"):
+            did = str(_lk["rows"][0].get("ledgerid"))
     if not did:
-        return {"rows": [], "columns": ["metric", "value"], "row_count": 0, "error": "Provide distributor_id"}
+        return {"rows": [], "columns": ["metric", "value"], "row_count": 0, "error": "Provide distributor_id or distributor_name"}
     p_did = {**p}
     rbac = rbac_clause(p_did); qp_base = build_params(userid, p_did)
     df_ss = _date_filter("td.vch_date", p)
@@ -361,8 +370,17 @@ def combined_distributor_deep(userid, params=None):
     """Deep dive: single distributor across all modules with growth."""
     p = params or {}
     did = str(p.get("distributor_id", "")).strip()
+    dname = str(p.get("distributor_name", "")).strip()
+    if not did and dname:
+        # The router only knows the NAME the user gave — resolve it to the id.
+        _lk = run_query(
+            "SELECT ledgerid FROM ledgermaster WHERE ledgername ILIKE :dn LIMIT 1",
+            {"dn": f"%{dname}%"},
+        )
+        if _lk.get("rows"):
+            did = str(_lk["rows"][0].get("ledgerid"))
     if not did:
-        return {"rows": [], "columns": ["metric", "value"], "row_count": 0, "error": "Provide distributor_id"}
+        return {"rows": [], "columns": ["metric", "value"], "row_count": 0, "error": "Provide distributor_id or distributor_name"}
     rbac = rbac_clause(p); qp_base = build_params(userid, p)
     df_ss = _date_filter("td.vch_date", p)
     df_pur = _date_filter("td.vch_date", p)

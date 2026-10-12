@@ -6,10 +6,13 @@ with TTL response caching for high performance.
 import hashlib
 import json
 import logging
+import os
 import re
+import threading
 import time
-import urllib.request
 from typing import Any, Dict, Optional, Tuple
+
+import httpx
 
 from ..config.settings import settings
 
@@ -18,6 +21,31 @@ _genai_client = None
 
 # In-memory response cache: { cache_key -> (timestamp, result) }
 _LLM_RESPONSE_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+# ── Persistent HTTP connection pool for OCI OpenAI-compatible endpoint ──
+# A single httpx.Client is reused across all calls, eliminating per-request
+# TCP handshake + SSL negotiation (saves 150–400 ms per OCI LLM call).
+_oci_http_client: "httpx.Client | None" = None
+_oci_http_client_lock = threading.Lock()
+
+
+def _get_oci_http_client() -> httpx.Client:
+    """Return the shared httpx.Client for OCI calls, creating it on first use."""
+    global _oci_http_client
+    if _oci_http_client is None:
+        with _oci_http_client_lock:
+            if _oci_http_client is None:
+                _oci_http_client = httpx.Client(
+                    timeout=httpx.Timeout(60.0),
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                        keepalive_expiry=60.0,
+                    ),
+                    http2=False,
+                )
+                logger.info("[LLM] OCI httpx connection pool initialised (keep-alive, max=20)")
+    return _oci_http_client
 
 
 def _get_cache_key(provider: str, model: str, system: str, user: str, is_json: bool) -> str:
@@ -33,7 +61,12 @@ def clear_llm_cache() -> None:
 
 
 def _call_oci_openai(system: str, user: str, is_json: bool = False) -> str:
-    """Call OCI Generative AI OpenAI-compatible endpoint for Google Gemini 2.5 Flash."""
+    """Call OCI Generative AI OpenAI-compatible endpoint using persistent httpx pool.
+
+    Uses a module-level httpx.Client with keep-alive connections so that
+    repeated calls reuse the same TCP/TLS session instead of re-handshaking
+    each time (saves 150-400 ms per call over urllib.request).
+    """
     base_url = (settings.OCI_BASE_URL or "").rstrip("/")
     if not base_url:
         raise ValueError("OCI_BASE_URL is empty")
@@ -42,33 +75,52 @@ def _call_oci_openai(system: str, user: str, is_json: bool = False) -> str:
     api_key = settings.OCI_API_KEY
     model = settings.OCI_MODEL or "google.gemini-2.5-flash"
 
-    messages = []
+    messages: list = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": user + ("\n\nReturn ONLY valid JSON, no markdown code fences." if is_json else "")})
+    messages.append(
+        {
+            "role": "user",
+            "content": user + ("\n\nReturn ONLY valid JSON, no markdown code fences." if is_json else ""),
+        }
+    )
 
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.2 if is_json else 0.7,
+        # JSON calls (routing / chart spec) default to temperature 0 so the SAME
+        # question always routes to the SAME flag — routing flip-flops at 0.2.
+        "temperature": float(os.environ.get("LLM_JSON_TEMPERATURE", "0")) if is_json else 0.7,
         "max_tokens": 4000,
     }
 
-    req_data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
 
-    req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        resp_body = resp.read().decode("utf-8")
-        parsed = json.loads(resp_body)
-        choices = parsed.get("choices", [])
-        if choices and len(choices) > 0:
-            content = choices[0].get("message", {}).get("content", "")
-            return content or ""
-        return ""
+    client = _get_oci_http_client()
+    try:
+        response = client.post(endpoint, json=payload, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        err_body = ""
+        try:
+            err_body = exc.response.text[:800]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"OCI HTTP {exc.response.status_code}: {err_body or 'no body'}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"OCI request error: {exc}") from exc
+
+    parsed = response.json()
+    choices = parsed.get("choices", [])
+    if choices:
+        content = choices[0].get("message", {}).get("content", "")
+        return content or ""
+    return ""
 
 
 def _call_genai_sdk(system: str, user: str, is_json: bool = False) -> str:
@@ -193,5 +245,75 @@ def call_llm_json(system: str, user: str) -> Any:
         return {}
 
 
+def call_oci_text(system: str, user: str) -> str:
+    """Call OCI Generative AI directly.
+    
+    STRICT: Absolutely NO fallback to Gemini. If OCI fails, raises exception directly.
+    """
+    logger.info("[LLM] Analysis via OCI OpenAI (%s) [Strict OCI - No fallback to Gemini]", settings.OCI_MODEL)
+    return _call_oci_openai(system, user, is_json=False)
 
+
+def stream_oci_text(system: str, user: str):
+    """Stream text from OCI Generative AI using OpenAI Responses API.
+    
+    STRICT: Absolutely NO fallback to Gemini.
+    Uses client.responses.create(model=settings.OCI_MODEL, input=..., stream=True).
+    """
+    from openai import OpenAI
+
+    base_url = (settings.OCI_BASE_URL or "").rstrip("/")
+    if not base_url:
+        raise ValueError("OCI_BASE_URL is empty")
+
+    api_key = settings.OCI_API_KEY
+    model = settings.OCI_MODEL or "google.gemini-2.5-flash"
+
+    # Format input prompt
+    if system:
+        full_prompt = f"System Instructions:\n{system}\n\nUser Question:\n{user}"
+    else:
+        full_prompt = user
+
+    logger.info("[LLM] Phase 2 Streaming via OCI OpenAI (%s) [Strict OCI - No fallback to Gemini]", model)
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    try:
+        stream = client.responses.create(
+            model=model,
+            input=full_prompt,
+            stream=True,
+        )
+        for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield delta
+            elif hasattr(event, "delta") and isinstance(event.delta, str):
+                if event.delta:
+                    yield event.delta
+    except Exception as exc:
+        logger.warning("[LLM] OCI responses.create streaming failed: %s. Attempting chat.completions fallback...", exc)
+        try:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": user})
+
+            chat_stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                temperature=0.1,
+                max_tokens=4000,
+            )
+            for chunk in chat_stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except Exception as exc2:
+            # STRICT: Absolutely NO fallback to Gemini. Raise OCI error directly!
+            logger.error("[LLM] OCI streaming failed completely: %s", exc2)
+            raise RuntimeError(f"OCI streaming error: {exc2}") from exc2
 

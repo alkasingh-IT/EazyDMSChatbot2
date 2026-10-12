@@ -231,8 +231,14 @@ def pr12_trend_6m(userid, params=None):
 
 def pr14_compare_periods(userid, params=None):
     p = params or {}; rbac = rbac_clause(p); qp = build_params(userid, p)
-    if p.get("date_from") and p.get("date_to"):
-        from datetime import datetime, timedelta
+    from datetime import datetime, timedelta
+    if p.get("date_from_1") and p.get("date_to_1") and p.get("date_from_2") and p.get("date_to_2"):
+        # Router style: BOTH periods supplied explicitly (e.g. Q1 vs Q2)
+        qp["cur_from"] = str(p["date_from_1"]); qp["cur_to"] = str(p["date_to_1"])
+        qp["prev_from"] = str(p["date_from_2"]); qp["prev_to"] = str(p["date_to_2"])
+        df = "AND si.invoicedate >= :cur_from AND si.invoicedate < :cur_to"
+        df_prev = "AND si.invoicedate >= :prev_from AND si.invoicedate < :prev_to"
+    elif p.get("date_from") and p.get("date_to"):
         d_from = datetime.strptime(str(p["date_from"]), "%Y-%m-%d").date()
         d_to = datetime.strptime(str(p["date_to"]), "%Y-%m-%d").date()
         span = (d_to - d_from).days + 1
@@ -578,11 +584,21 @@ def pr28_pareto(userid, params=None):
 def pr29_distributor_compare(userid, params=None):
     p = params or {}; df = _date_filter("si.invoicedate", p); rbac = rbac_clause(p); qp = build_params(userid, p)
     ids = str(p.get("distributor_ids", "")).strip()
-    if not ids:
-        return {"rows": [], "columns": ["ds_code", "ds_name", "total_primary_sales", "invoices"], "row_count": 0, "error": "Provide distributor_ids (comma-separated)"}
-    qp["dids"] = tuple(x.strip() for x in ids.split(",") if x.strip())
-    placeholders = ",".join(f":did{i}" for i in range(len(qp["dids"])))
-    for i, did in enumerate(qp["dids"]): qp[f"did{i}"] = did
+    names = str(p.get("distributor_names", "")).strip()
+    if not ids and not names:
+        return {"rows": [], "columns": ["ds_code", "ds_name", "total_primary_sales", "invoices"], "row_count": 0, "error": "Provide distributor_ids or distributor_names (comma-separated)"}
+    id_list = [x.strip() for x in ids.split(",") if x.strip()] if ids else []
+    name_list = [x.strip() for x in names.split(",") if x.strip()] if names else []
+    id_ph = ",".join(f":did{i}" for i in range(len(id_list)))
+    name_ph = ",".join(f":dname{i}" for i in range(len(name_list)))
+    for i, did in enumerate(id_list): qp[f"did{i}"] = did
+    for i, nm in enumerate(name_list): qp[f"dname{i}"] = nm
+    if id_list and name_list:
+        match_sql = f"(CAST(si.distributorid AS TEXT) IN ({id_ph}) OR ds.ledgercode IN ({id_ph}) OR ds.ledgername IN ({name_ph}))"
+    elif id_list:
+        match_sql = f"(CAST(si.distributorid AS TEXT) IN ({id_ph}) OR ds.ledgercode IN ({id_ph}))"
+    else:
+        match_sql = f"ds.ledgername IN ({name_ph})"
     return run_query(f"""
         SELECT ds.ledgercode AS ds_code, ds.ledgername AS ds_name, SUM(si.net_amount) AS total_primary_sales,
                COUNT(DISTINCT si.invoiceno) AS invoices,
@@ -590,7 +606,7 @@ def pr29_distributor_compare(userid, params=None):
                COUNT(DISTINCT DATE_TRUNC('month', si.invoicedate)) AS active_months
         FROM sale_salesinvoice si INNER JOIN ({rbac}) accd ON accd.locationid=si.distributorid
         JOIN ledgermaster ds ON ds.ledgerid = si.distributorid AND ds.ledgertype = 1
-        WHERE si.iscancelled=FALSE AND (CAST(si.distributorid AS TEXT) IN ({placeholders}) OR ds.ledgercode IN ({placeholders})) {df}
+        WHERE si.iscancelled=FALSE AND {match_sql} {df}
         GROUP BY ds.ledgercode, ds.ledgername ORDER BY total_primary_sales DESC
     """, qp)
 
@@ -800,4 +816,3 @@ PRIMARY_SALES_FLAGS = {
     "pr:distributor-consistency":(pr37_distributor_consistency, "Distributor consistency score by active primary months"),
     "pr:year-on-year":          (pr38_year_on_year,       "Month-by-month primary sales vs same month last year"),
 }
-

@@ -270,7 +270,7 @@ async def register_db(request: Request):
         log_detailed_error("DMS DB REGISTER INVALID URL FORMAT", err, {"db_url": _mask_url(db_url)})
         raise HTTPException(status_code=400, detail="Decrypted value is not a valid SQLAlchemy database URL.")
 
-    staff_uid = _header(request, "x-staff-uid", "x_staff_uid")
+    staff_uid = _header(request, "u-uid", "x-staff-uid", "x_staff_uid")
     if not staff_uid:
         raise HTTPException(status_code=401, detail="X-Staff-UID is required for database registration.")
     session_uid = str(uuid.uuid4())

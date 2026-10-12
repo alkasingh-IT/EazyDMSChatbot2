@@ -34,6 +34,10 @@ OUTPUT_LANG_LABELS: dict[str, str] = {
 VALID_OUTPUT_LANGS: set[str] = set(OUTPUT_LANG_LABELS.keys())
 DEFAULT_OUTPUT_LANG = "auto"
 
+VALID_OUTPUT_SCRIPTS: set[str] = {"native", "roman"}
+DEFAULT_OUTPUT_SCRIPT = "native"
+
+
 _LOCK = threading.Lock()
 
 def _get_aes_key() -> bytes:
@@ -207,3 +211,28 @@ class UserPrefsService:
     @staticmethod
     def output_langs() -> list[dict]:
         return [{"code": k, "label": v} for k, v in OUTPUT_LANG_LABELS.items()]
+
+    # ── Output script preference (native vs roman) ───────────────────────────
+    @staticmethod
+    def get_output_script(uid: str) -> str:
+        if not uid:
+            return DEFAULT_OUTPUT_SCRIPT
+        with _LOCK:
+            data = _load_all()
+        return data.get(uid, {}).get("output_script", DEFAULT_OUTPUT_SCRIPT)
+
+    @staticmethod
+    def set_output_script(uid: str, script: str) -> str:
+        if not uid:
+            return DEFAULT_OUTPUT_SCRIPT
+        script_clean = str(script or "").strip().lower()
+        if script_clean not in VALID_OUTPUT_SCRIPTS:
+            script_clean = DEFAULT_OUTPUT_SCRIPT
+        with _LOCK:
+            data = _load_all()
+            if uid not in data:
+                data[uid] = {}
+            data[uid]["output_script"] = script_clean
+            _save_all(data)
+        return script_clean
+

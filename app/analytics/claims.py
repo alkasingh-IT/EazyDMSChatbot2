@@ -175,4 +175,3 @@ CLAIMS_FLAGS = {
     "clm:aging-report":         (clm_aging_report,         "Claim aging report (0-30, 31-60, 60+ days) [RSM+]"),
     "clm:rejection-rate":       (clm_rejection_rate,       "Claim rejection rate percentage by distributor/territory [ZSM+]"),
 }
-

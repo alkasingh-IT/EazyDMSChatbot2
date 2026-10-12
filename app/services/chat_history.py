@@ -74,6 +74,7 @@ def init_chat_history() -> None:
                 u_uid TEXT NOT NULL,
                 role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
                 content TEXT NOT NULL,
+                data_snapshot TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_uid_content
@@ -83,6 +84,10 @@ def init_chat_history() -> None:
         path = _DB_PATH.parent / f"{_DB_PATH.stem}-{index:03d}{_DB_PATH.suffix or '.sqlite3'}"
         with _SHARD_LOCKS[index], _connect(path) as conn:
             conn.executescript(schema)
+            try:
+                conn.execute("ALTER TABLE chat_messages ADD COLUMN data_snapshot TEXT")
+            except Exception:
+                pass
 
 
 def _safe_uid(u_uid: str) -> str:
@@ -92,7 +97,7 @@ def _safe_uid(u_uid: str) -> str:
     return value
 
 
-def save_turn(u_uid: str, session_id: str, question: str, answer: str) -> str:
+def save_turn(u_uid: str, session_id: str, question: str, answer: str, data_snapshot: Optional[Dict[str, Any]] = None) -> str:
     uid = _safe_uid(u_uid)
     sid = str(session_id or "").strip()[:128]
     question = str(question or "").strip()[:_MAX_CONTENT]
@@ -123,9 +128,11 @@ def save_turn(u_uid: str, session_id: str, question: str, answer: str) -> str:
             (sid, uid, question, now),
         )
         if answer:
+            import json as _json
+            snap_json = _json.dumps(data_snapshot, ensure_ascii=False, default=str) if data_snapshot else None
             conn.execute(
-                "INSERT INTO chat_messages(session_id, u_uid, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)",
-                (sid, uid, answer, now),
+                "INSERT INTO chat_messages(session_id, u_uid, role, content, data_snapshot, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)",
+                (sid, uid, answer, snap_json, now),
             )
         conn.execute(
             """DELETE FROM chat_messages WHERE session_id = ? AND id NOT IN
@@ -156,7 +163,7 @@ def list_sessions(u_uid: str, search: str = "", limit: int = 40) -> List[Dict[st
         result = []
         for row in rows:
             messages = conn.execute(
-                "SELECT role, content, created_at FROM chat_messages WHERE session_id = ? AND u_uid = ? ORDER BY id ASC",
+                "SELECT role, content, data_snapshot, created_at FROM chat_messages WHERE session_id = ? AND u_uid = ? ORDER BY id ASC",
                 (row["session_id"], uid),
             ).fetchall()
             result.append({
@@ -165,6 +172,14 @@ def list_sessions(u_uid: str, search: str = "", limit: int = 40) -> List[Dict[st
                 "dateKey": row["date_key"],
                 "created": row["created_at"],
                 "updated": row["updated_at"],
-                "messages": [dict(message) for message in messages],
+                "messages": [
+                {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "created_at": m["created_at"],
+                    **({"data_snapshot": __import__("json").loads(m["data_snapshot"])} if ("data_snapshot" in m.keys() and m["data_snapshot"]) else {})
+                }
+                for m in messages
+            ],
             })
         return result

@@ -119,8 +119,16 @@ async def _build_dsn_for_uid(uid: Optional[str] = None) -> str:
 
     raw_env = (os.environ.get("DATABASE_URL") or "").strip()
     if raw_env and raw_env not in ("''", '""'):
-        logger.warning("[DB ROUTE] UID=%s has no registered database; using DATABASE_URL fallback", target_uid or "Unknown")
-        return _build_dsn()
+        # Default-DB fallback is allowed ONLY for the password-gated native chat
+        # (allow_default_db). Every other caller must have a registered session.
+        try:
+            from .db import allow_default_db
+            _fallback_ok = bool(allow_default_db.get())
+        except Exception:
+            _fallback_ok = False
+        if _fallback_ok:
+            logger.warning("[DB ROUTE] UID=%s has no registered database; using DATABASE_URL fallback (native chat only)", target_uid or "Unknown")
+            return _build_dsn()
 
     raise ValueError(f"Database registration required. No database registered for User ID '{target_uid or 'Unknown'}'.")
 

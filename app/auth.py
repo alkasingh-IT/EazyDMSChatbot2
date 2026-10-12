@@ -22,6 +22,18 @@ def _header(request: Request, *names: str) -> str:
 
 
 def require_request_identity(request: Request, allow_session_staff_resolution: bool = False) -> RequestIdentity:
+    # ── Native chat (password-gated) ──────────────────────────────────────────
+    # Detected entirely on the backend (valid gate Basic credentials + toggle).
+    # It is exempt from the strict registered-session model: it may use the
+    # default DB and identifies by the staff UID. Everything else is unchanged.
+    try:
+        from .services.native_gate import is_native_chat
+        if is_native_chat(request):
+            staff_uid = _header(request, "u-uid", "x-staff-uid", "x_staff_uid") or "native"
+            return RequestIdentity(session_uid=staff_uid, staff_uid=staff_uid)
+    except Exception:
+        pass
+
     session_uid = _header(request, "x-uid", "x_uid")
     # Staff UID — "u-uid" is accepted as a full alternative to "x-staff-uid"
     staff_uid = _header(request, "u-uid", "x-staff-uid", "x_staff_uid")
@@ -55,5 +67,6 @@ def is_public_path(path: str) -> bool:
         "/health",
         "/api/db/register",
         "/api/crypto/public-key",
+        "/api/native-chat/status",
+        "/api/staff",
     } or path.startswith("/static") or path.startswith("/chat")
-

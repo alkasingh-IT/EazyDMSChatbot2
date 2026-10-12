@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DMS AI Chatbot — Test Harness</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; width: 100%; overflow: hidden; }
+    body { font-family: 'Inter', -apple-system, sans-serif; background: #f8fafc; }
+    #dmsTestBar {
+      position: fixed; top: 8px; right: 8px; z-index: 99999;
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(15, 23, 42, 0.92); color: #e2e8f0;
+      padding: 6px 10px; border-radius: 10px; font-size: 11px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    }
+    #dmsTestBar input {
+      background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
+      border-radius: 6px; padding: 3px 8px; font-size: 11px; width: 120px; outline: none;
+    }
+    #dmsTestBar button {
+      background: #2563eb; color: #fff; border: none; border-radius: 6px;
+      padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
+    }
+    #dmsTestBar button:hover { background: #1d4ed8; }
+    #dmsTestBar .lbl { color: #94a3b8; }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <div id="dmsTestBar">
+    <span class="lbl">X-UID:</span>
+    <input id="dmsUserUidInput" placeholder="session UUID" />
+    <span class="lbl">X-Staff-UID:</span>
+    <input id="dmsUidInput" placeholder="staff UID" />
+    <button onclick="dmsApplyUid()">Apply</button>
+  </div>
+
+  <div id="root"></div>
+
+  <script>
+    // ── Test bar: sets the identity used by the component's auto-mount bootstrap ──
+    (function () {
+      var saved = localStorage.getItem('dms_staff_uid');
+      var savedUser = localStorage.getItem('dms_session_uid');
+      if (saved) document.getElementById('dmsUidInput').value = saved;
+      if (savedUser) document.getElementById('dmsUserUidInput').value = savedUser;
+    })();
+    function dmsApplyUid() {
+      var xUid = document.getElementById('dmsUidInput').value.trim();
+      var uUid = document.getElementById('dmsUserUidInput').value.trim();
+      localStorage.setItem('dms_staff_uid', xUid);
+      localStorage.setItem('dms_session_uid', uUid);
+      location.reload();
+    }
+
+    window.dmsUser = {
+      'X-UID': localStorage.getItem('dms_session_uid') || '',
+      'X-Staff-UID': localStorage.getItem('dms_staff_uid') || ''
+    };
+
+    // ── Loader: fetch the GATED component, shim ESM syntax, mount via Babel ──
+    (function () {
+      var JS_URL = '/d3/DMSAIChat.jsx?v=' + Date.now();
+      var rootEl = document.getElementById('root');
+      function fail(msg) {
+        rootEl.innerHTML = '<div style="padding:24px;font-family:monospace;color:#ef4444;background:#fff;height:100%">' +
+          '<strong>Failed to load DMSAIChat.jsx</strong><br><br>' + msg + '</div>';
+      }
+      fetch(JS_URL, { cache: 'no-store' })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + JS_URL); return r.text(); })
+        .then(function (src) {
+          var importReplaced = false;
+          src = src.replace(/^import\s*\{[^}]*\}\s*from\s*["']react["'];?\s*$/m, function (m) {
+            importReplaced = true;
+            return 'const { useState, useEffect, useRef, useCallback, useMemo } = React;';
+          });
+          if (!importReplaced) throw new Error('Could not find the react import line to shim.');
+          src = src.replace(/^export\s+default\s+/m, '');
+          var out = Babel.transform(src, { presets: [['react', { runtime: 'classic' }]], sourceType: 'script' }).code;
+          (0, eval)(out);
+          setTimeout(function () {
+            if (!rootEl.querySelector('.nac-shell, .nac-root, [class*="nac-"]')) {
+              console.warn('[dmsai test] Component evaluated but no nac- markup found in #root — check console for errors.');
+            }
+          }, 1500);
+        })
+        .catch(function (e) {
+          fail(String(e && e.message ? e.message : e));
+          console.error('[dmsai test] Load error:', e);
+        });
+    })();
+  </script>
+</body>
+</html>

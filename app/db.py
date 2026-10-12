@@ -40,6 +40,10 @@ current_user_id: ContextVar[Optional[str]] = ContextVar("current_user_id", defau
 # Per-request DB routing override — set before calling analytics functions so every
 # internal run_query call routes to the correct registered DB without needing _db_uid in params.
 current_db_uid: ContextVar[Optional[str]] = ContextVar("current_db_uid", default=None)
+# When True, a request with NO registered session DB may fall back to DATABASE_URL.
+# ONLY the password-gated native chat sets this. The general app must never fall
+# back — a missing session there is an error, not a silent default.
+allow_default_db: ContextVar[bool] = ContextVar("allow_default_db", default=False)
 
 _engines_cache: Dict[str, Engine] = {}
 _engine_lock = threading.Lock()
@@ -133,7 +137,14 @@ def get_engine(uid: Optional[str] = None) -> Engine:
             logger.warning("Could not fetch session DB URL for UID %s: %s", uid, e)
 
     if not target_url:
-        target_url = (os.environ.get("DATABASE_URL", "") or "").strip()
+        # Default-DB fallback is allowed ONLY for the password-gated native chat
+        # (allow_default_db). Every other caller must have a registered session.
+        if allow_default_db.get():
+            target_url = (os.environ.get("DATABASE_URL", "") or "").strip()
+            if target_url:
+                logger.info("[DB ROUTE] No session DB — using default DATABASE_URL (native chat only)")
+        else:
+            target_url = ""
 
     if target_url.startswith("psql"):
         target_url = target_url[4:].strip().strip("\"' \t\r\n")

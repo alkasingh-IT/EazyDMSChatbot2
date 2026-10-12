@@ -16,6 +16,7 @@ except ImportError:
         speech_router = APIRouter(prefix="/api", tags=["speech"])
 
 from .prefs import router as prefs_router
+from .chat_actions import router as chat_actions_router
 
 __all__ = [
     "main_router",
@@ -26,5 +27,6 @@ __all__ = [
     "database_router",
     "speech_router",
     "prefs_router",
+    "chat_actions_router",
 ]
 
