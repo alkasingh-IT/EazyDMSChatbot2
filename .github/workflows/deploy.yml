@@ -5,18 +5,20 @@ on:
   push:
     branches:
       - main
+      - uat
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: dms-production
+  group: dms-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    runs-on: [self-hosted, Linux, X64]
+  deploy-prod:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, dms-prod]
     timeout-minutes: 15
 
     steps:
@@ -68,7 +70,7 @@ jobs:
               http://127.0.0.1:13000/ 2>/dev/null || true)
 
             if [ -n "$code" ] && [ "$code" != "000" ]; then
-              echo "Application responded with HTTP $code"
+              echo "Production responded with HTTP $code"
               exit 0
             fi
 
@@ -78,3 +80,69 @@ jobs:
           sudo /usr/bin/systemctl status dms.service --no-pager || true
           sudo journalctl -u dms.service -n 80 --no-pager
           exit 1
+
+  deploy-uat:
+    if: github.ref == 'refs/heads/uat'
+    runs-on: [self-hosted, Linux, X64, dms-uat]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment prerequisites
+        run: |
+          test -f run.py
+          test -f requirements.txt
+          test -x /home/ubuntu/dmgg/venv/bin/python
+          test -f /home/ubuntu/dmgg/.env
+          command -v rsync
+          command -v curl
+
+      - name: Sync application files
+        run: |
+          rsync -rlptD --delete \
+            --exclude='/.git/' \
+            --exclude='/.env' \
+            --exclude='/.env.*' \
+            --exclude='/venv/' \
+            --exclude='/.dms_sessions/' \
+            --exclude='/.dms_rsa_private_key.pem' \
+            --exclude='/.user_prefs.enc' \
+            --exclude='/nohup.out' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='.update_backups/' \
+            ./ /home/ubuntu/dmgg/
+
+      - name: Install Python dependencies
+        run: |
+          /home/ubuntu/dmgg/venv/bin/python -m pip install \
+            -r /home/ubuntu/dmgg/requirements.txt
+
+      - name: Restart DMS
+        run: |
+          sudo /usr/bin/systemctl restart dms.service
+          sleep 5
+          sudo /usr/bin/systemctl is-active dms.service
+
+      - name: Verify application response
+        run: |
+          for attempt in $(seq 1 12); do
+            code=$(curl -sS -o /dev/null \
+              --max-time 5 \
+              -w '%{http_code}' \
+              http://127.0.0.1:13000/ 2>/dev/null || true)
+
+            if [ -n "$code" ] && [ "$code" != "000" ]; then
+              echo "UAT responded with HTTP $code"
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          sudo /usr/bin/systemctl status dms.service --no-pager || true
+          sudo journalctl -u dms.service -n 80 --no-pager
+          exit 1
+
